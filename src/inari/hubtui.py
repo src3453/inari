@@ -387,7 +387,9 @@ class HubApp:
         if active:
             j = active[0]
             right.append("● ", style=p.accent)
-            speed = f"{hub.human(j.speed)}/s" if j.speed else "starting…"
+            sp = j.speed
+            speed = (f"{hub.human(sp)}/s" if sp else "waiting" if j.via == "waiting"
+                     else "stalled" if j.stalled else "starting…")
             right.append(f"downloading {j.frac * 100:.0f}% · {speed}", style=p.accent)
             if queued:
                 right.append(f" · +{queued} queued", style=p.accent2)
@@ -583,9 +585,13 @@ class HubApp:
                 name.append(" +mmproj", style=p.info)
             if j.status == "downloading" and j.via == "waiting":
                 note = Text("waiting — another process is downloading this file", style=p.warn)
-            elif j.status == "downloading" and j.speed:
-                eta = (j.total - j.done) / j.speed
-                note = Text(f"{hub.human(j.speed)}/s · {dur(eta)} left · {j.via or j.backend}", style=p.accent2)
+            elif j.status == "downloading" and (sp := j.speed):
+                note = Text(f"{hub.human(sp)}/s · {dur(max(0, j.total - j.shown) / sp)} left · {j.via or j.backend}",
+                            style=p.accent2)
+            elif j.stalled:
+                note = Text(f"stalled — no data for a few seconds · {j.via}", style=p.warn)
+            elif j.status == "downloading" and j.via:
+                note = Text(f"connecting… · {j.via}", style=p.accent2)
             elif j.status == "done":
                 note = Text(f"profile: {j.profile}" if j.profile else "p → make profile",
                             style=p.good if j.profile else p.accent2)
@@ -596,7 +602,7 @@ class HubApp:
             t.add_row(Text("▸" if on else " ", style=p.accent), Text(icon, style=color), name,
                       Bar(j.frac, p.good if j.status == "done" else color, p.track),
                       Text(f"{j.frac * 100:.0f}%", style=color),
-                      Text(f"{hub.human(j.done)} / {hub.human(j.total)}", style=p.dim), note)
+                      Text(f"{hub.human(j.shown)} / {hub.human(j.total)}", style=p.dim), note)
         done = sum(1 for j in jobs if j.status == "done")
         return self.panel(t, "Downloads", focused=focused, height=height,
                           subtitle=f" {done}/{len(jobs)} done · Tab to select ")
