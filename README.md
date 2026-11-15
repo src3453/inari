@@ -4,7 +4,7 @@ llama.cpp の `llama-server` を、黄色基調の豪華なモニタリング TU
 
 ![overview](docs/overview.svg)
 
-- **HuggingFace から GGUF をダウンロード** — TUI で検索 → 量子化を選んでダウンロード、または `repo:QUANT` 指定。分割 GGUF、mmproj に対応
+- **HuggingFace から GGUF をダウンロード** — TUI で検索 → 量子化を選んでダウンロード、または `repo:QUANT` 指定。分割 GGUF、mmproj に対応。保存先は llama.cpp の `-hf` と同じ Hugging Face キャッシュで、Xet / HTTP を切り替え可能
 - **起動引数のプロファイル化** — `~/.inari/profiles/*.toml` に保存
 - **モニタリング TUI** — 7 ビュー（Overview / Serving / Requests / Engine / Hardware / Logs / Connect）
 - **バックグラウンド起動** — TUI を閉じてもサーバーは動いたまま。`inari monitor` で再接続できる
@@ -26,6 +26,10 @@ uv run inari hub qwen3 8b
 
 # ダウンロード（候補表から選ぶ or :QUANT で直接指定）→ そのままプロファイル作成
 uv run inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M -p qwen3-8b
+uv run inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M --via http   # バックエンドを指定（auto / xet / http）
+
+# ローカルのモデル一覧（HF キャッシュ + models_dir）
+uv run inari models
 
 # プロファイル編集
 uv run inari profile set qwen3-8b ctx-size=32768 flash-attn=on "-ot=exps=CPU" extra+=--no-webui
@@ -46,7 +50,7 @@ uv run inari demo
 
 ```toml
 description = "Qwen3 8B"
-model = "unsloth__Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"   # models_dir からの相対パス or 絶対パス
+model = "hf://unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"   # HF キャッシュ参照 / models_dir からの相対パス / 絶対パス
 host = "127.0.0.1"
 port = 8080
 extra = ["--no-webui"]          # そのまま末尾に追加
@@ -62,7 +66,28 @@ flash-attn = "on"
 GGML_VK_VISIBLE_DEVICES = "0"
 ```
 
-`--metrics` はモニタが使うので自動で付与されます。
+`--metrics` はモニタが使うので自動で付与されます。`hf://owner/repo/file` という値（`model` や `mmproj` など）は、起動時に HF キャッシュ内のファイルパスに変換されます。
+
+### モデルの保存先と llama.cpp との共有
+
+ダウンロードしたモデルは **Hugging Face キャッシュ**（`~/.cache/huggingface/hub/models--owner--repo/`）に保存されます。llama.cpp の `-hf` や `huggingface-cli` と同じ場所・同じ形式なので、
+
+- `inari pull` したモデルは `llama-server -hf owner/repo:QUANT` で再ダウンロードなしに使える
+- `llama-server -hf` で落としたモデルも `inari models` に出てきて、プロファイルから使える
+- 途中まで落としたファイル（`blobs/<sha256>.downloadInProgress`）は、HTTP なら inari と llama.cpp のどちらからでも再開できる
+- 同じファイルを同時に落とそうとすると、片方が待つ（`.locks/` のロックを共有）
+
+キャッシュの場所は llama.cpp と同じ順で決まります: `LLAMA_CACHE` → `HF_HUB_CACHE` → `HUGGINGFACE_HUB_CACHE` → `HF_HOME/hub` → `XDG_CACHE_HOME/huggingface/hub` → `~/.cache/huggingface/hub`。`inari config set hf_cache <dir>` で個別に指定した場合は、inari から起動する llama-server にも `LLAMA_CACHE` として渡します。
+
+**ダウンロード方式**は `inari config set download_backend auto|xet|http`、`pull --via ...`、Hub TUI の `v` キーで切り替えられます。
+
+| 方式 | 内容 |
+|---|---|
+| `auto`（既定） | `hf_xet` が入っていれば Xet。HTTP の途中ファイルがあるときは HTTP で再開 |
+| `xet` | Xet（`hf_xet`）で取得。速いが、中止すると最初からやり直し |
+| `http` | 普通の HTTP。Range で途中から再開できる |
+
+以前の版で `~/.inari/models/owner__repo/` に落としたモデルは、`inari models migrate` で HF キャッシュへ移動できます。それを参照しているプロファイルも書き換えます。移行しなくても、これまで通り読み込めます。
 
 ### Hub（検索 TUI）のキー
 
@@ -71,8 +96,9 @@ GGML_VK_VISIBLE_DEVICES = "0"
 | `/` | 検索語を入力（Enter で検索） |
 | `o` | 並び順切替（downloads / trending / likes / updated） |
 | `↑` `↓` `Enter` | リポジトリを選んでファイル一覧へ |
-| `Enter` / `d` | 選んだ量子化をダウンロードキューに追加（`.part` から再開可能） |
+| `Enter` / `d` | 選んだ量子化をダウンロードキューに追加 |
 | `m` | vision projector（mmproj）も一緒に落とす |
+| `v` | ダウンロード方式を切替（auto / xet / http）。次に追加するダウンロードから有効 |
 | `Tab` | ダウンロード一覧へ移動 → `p` でプロファイル作成、`x` でキャンセル |
 | `Esc` | 戻る |
 | `b` | Hugging Face のページをブラウザで開く |
@@ -98,4 +124,4 @@ GGML_VK_VISIBLE_DEVICES = "0"
 
 AMD / Intel GPU では負荷・温度は表示されませんが、VRAM 使用量は llama.cpp のバッファサイズから推定します。
 
-保存先は `INARI_HOME`（既定 `~/.inari`）、モデル置き場は `INARI_MODELS` か `inari config set models_dir ...` で変更できます。
+保存先は `INARI_HOME`（既定 `~/.inari`）。ダウンロードは HF キャッシュ（上記）に入ります。手で置いた GGUF 用の `models_dir` は `INARI_MODELS` か `inari config set models_dir ...` で変更できます。

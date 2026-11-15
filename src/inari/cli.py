@@ -15,7 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from inari import __version__
-from inari import hub, server
+from inari import hfcache, hub, server
 from inari import theme as th
 from inari.config import Config, config_path, home
 from inari.profiles import Profile, list_profiles, new_profile
@@ -34,10 +34,7 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def rel_model(p: Path) -> str:
-    try:
-        return str(p.resolve().relative_to(cfg.models_path().resolve())).replace("\\", "/")
-    except ValueError:
-        return str(p)
+    return hub.model_ref(cfg, p)
 
 
 # ───────────────────────── pull / models ─────────────────────────
@@ -49,8 +46,8 @@ def cmd_hub(a: argparse.Namespace) -> None:
         app.run()
     except KeyboardInterrupt:
         pass
-    if app.theme_name != cfg.theme:
-        cfg.theme = app.theme_name
+    if app.theme_name != cfg.theme or app.dl.backend != cfg.download_backend:
+        cfg.theme, cfg.download_backend = app.theme_name, app.dl.backend
         cfg.save()
     for j in app.dl.jobs:
         if j.status == "done":
@@ -66,7 +63,7 @@ def cmd_pull(a: argparse.Namespace) -> None:
     if not a.repo:
         return cmd_hub(argparse.Namespace(query=[]))
     try:
-        model, mmproj = hub.pull(a.repo, cfg, console, yes=a.yes)
+        model, mmproj = hub.pull(a.repo, cfg, console, yes=a.yes, backend=a.via or "")
     except Exception as e:  # network / auth / 404
         die(f"download failed: {e}")
     if model is None:
@@ -78,24 +75,66 @@ def cmd_pull(a: argparse.Namespace) -> None:
     if name:
         prof = new_profile(name, model=rel_model(model), description=f"from {a.repo}")
         if mmproj:
-            prof.args["mmproj"] = str(mmproj)
+            prof.args["mmproj"] = rel_model(mmproj)
         prof.save()
         console.print(f"[good]✔ Profile[/] [accent]{name}[/] saved → [dim]{Profile.path_for(name)}[/]")
         console.print(f"  run it: [accent]inari serve {name}[/]")
 
 
 def cmd_models(a: argparse.Namespace) -> None:
+    if getattr(a, "action", None) == "migrate":
+        return cmd_migrate(a)
     items = hub.local_models(cfg)
-    t = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="accent",
-              title=f"[accent]Local models[/] [dim]{cfg.models_path()}[/]")
+    t = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="accent", title="[accent]Local models[/]")
     t.add_column("#", style="accent2", justify="right")
     t.add_column("MODEL", style="text")
     t.add_column("SIZE", justify="right", style="text")
-    for i, (p, size) in enumerate(items, 1):
-        t.add_row(str(i), rel_model(p), hub.human(size))
+    t.add_column("IN", style="dim")
+    for i, m in enumerate(items, 1):
+        t.add_row(str(i), m.ref, hub.human(m.size), m.source)
     if not items:
-        t.add_row("", "[dim]none yet — try: inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M[/]", "")
+        t.add_row("", "[dim]none yet — try: inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M[/]", "", "")
     console.print(t)
+    console.print(f"[dim]  hf  → {hfcache.cache_dir(cfg)}  (shared with llama-server -hf)[/]", soft_wrap=True)
+    console.print(f"[dim]  dir → {cfg.models_path()}[/]", soft_wrap=True)
+    if any(m.source == "dir" and "__" in Path(m.ref).parts[0] for m in items):
+        console.print("[dim]Old inari downloads found in models_dir — [accent]inari models migrate[/] moves them "
+                      "into the HF cache so llama-server -hf can use them too.[/]")
+
+
+def cmd_migrate(a: argparse.Namespace) -> None:
+    moved = hub.migrate(cfg, console, yes=a.yes)
+    if not moved:
+        return
+    # profiles may point at the old files by relative or absolute path
+    old = {}
+    for path, ref in moved.items():
+        old[path] = ref
+        old[rel_model(Path(path))] = ref  # still relative to models_dir (the file is gone, the string is not)
+        try:
+            old[Path(path).relative_to(cfg.models_path()).as_posix()] = ref
+        except ValueError:
+            pass
+    norm = {k.replace("\\", "/"): v for k, v in old.items()}
+
+    def swap(v):
+        if isinstance(v, str):
+            return norm.get(v.replace("\\", "/"), v)
+        if isinstance(v, list):
+            return [swap(x) for x in v]
+        return v
+
+    for n in list_profiles():
+        try:
+            p = Profile.load(n)
+        except Exception:
+            continue
+        before = (p.model, dict(p.args))
+        p.model = swap(p.model)
+        p.args = {k_: swap(v) for k_, v in p.args.items()}
+        if (p.model, p.args) != before:
+            p.save()
+            console.print(f"[good]✔ profile[/] [accent]{n}[/] [dim]now uses {p.model}[/]")
 
 
 # ───────────────────────── profiles ─────────────────────────
@@ -140,7 +179,7 @@ def pick_model_interactive() -> str:
     cmd_models(argparse.Namespace())
     idx = Prompt.ask("[accent]Model #[/] (or a path)", console=console)
     if idx.isdigit() and 1 <= int(idx) <= len(items):
-        return rel_model(items[int(idx) - 1][0])
+        return items[int(idx) - 1].ref
     return idx
 
 
@@ -328,7 +367,9 @@ def cmd_demo(a: argparse.Namespace) -> None:
 def cmd_config(a: argparse.Namespace) -> None:
     if a.action == "set":
         if not hasattr(cfg, a.key):
-            die(f"unknown key {a.key} (llama_server, models_dir, theme, hf_token)")
+            die(f"unknown key {a.key} (llama_server, models_dir, hf_cache, download_backend, theme, hf_token)")
+        if a.key == "download_backend" and a.value not in hub.BACKENDS:
+            die(f"download_backend must be one of {', '.join(hub.BACKENDS)}")
         setattr(cfg, a.key, a.value)
         cfg.save()
     t = Table.grid(padding=(0, 2))
@@ -337,7 +378,10 @@ def cmd_config(a: argparse.Namespace) -> None:
     t.add_row("home", str(home()))
     t.add_row("config", str(config_path()))
     t.add_row("llama_server", f"{cfg.llama_server or '(PATH)'}  →  {cfg.server_binary() or '[bad]not found[/]'}")
+    t.add_row("hf_cache", f"{hfcache.cache_dir(cfg)}  [dim]({'set' if cfg.hf_cache else 'same lookup as llama.cpp'})[/]")
     t.add_row("models_dir", str(cfg.models_path()))
+    xet = "hf_xet installed" if hub.xet_available() else "hf_xet not installed → http"
+    t.add_row("download_backend", f"{cfg.download_backend}  [dim]({', '.join(hub.BACKENDS)} · {xet})[/]")
     t.add_row("theme", f"{cfg.theme}  [dim]({', '.join(th.ORDER)})[/]")
     t.add_row("hf_token", "set" if cfg.hf_token else ("HF_TOKEN env" if os.environ.get("HF_TOKEN") else "—"))
     console.print(Panel(t, title="[accent] config [/]", title_align="left", border_style="dim", box=box.ROUNDED))
@@ -354,13 +398,17 @@ def build_parser() -> argparse.ArgumentParser:
                    "(omit to browse in the hub TUI)")
     s.add_argument("-p", "--profile", help="create a launch profile with this name")
     s.add_argument("-y", "--yes", action="store_true", help="no prompts (also downloads mmproj)")
+    s.add_argument("--via", choices=hub.BACKENDS, help="download backend (default: config download_backend)")
     s.set_defaults(fn=cmd_pull)
 
     s = sub.add_parser("hub", aliases=["search", "browse"], help="search Hugging Face and download GGUFs in a TUI")
     s.add_argument("query", nargs="*", help="initial search, e.g. qwen3 8b")
     s.set_defaults(fn=cmd_hub)
 
-    s = sub.add_parser("models", aliases=["ls"], help="list downloaded models")
+    s = sub.add_parser("models", aliases=["ls"], help="list local models (HF cache + models_dir)")
+    s.add_argument("action", nargs="?", choices=["list", "migrate"],
+                   help="migrate: move old inari downloads into the HF cache and update profiles")
+    s.add_argument("-y", "--yes", action="store_true")
     s.set_defaults(fn=cmd_models)
 
     s = sub.add_parser("profile", aliases=["p"], help="manage launch profiles")

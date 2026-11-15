@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from inari import hub
+from inari import hfcache, hub
 from inari import theme as th
 from inari.config import Config
 from inari.keys import KeyReader
@@ -186,6 +186,15 @@ class HubApp:
             self.theme_name = th.next_name(self.theme_name)
             self.p = th.get(self.theme_name)
             return False
+        if key == "v":
+            order = hub.BACKENDS
+            self.dl.backend = order[(order.index(self.dl.backend) + 1) % len(order)]
+            note = {"auto": "xet when available, http to resume partials", "xet": "hf_xet",
+                    "http": "plain HTTP, resumable"}[self.dl.backend]
+            if self.dl.backend == "xet" and not hub.xet_available():
+                note = "hf_xet is not installed — downloads will fail"
+            self.say(f"new downloads via {self.dl.backend} ({note})")
+            return False
         if key == "tab":
             if self.dl.jobs:
                 self.focus = "downloads" if self.focus == "main" else "main"
@@ -302,7 +311,7 @@ class HubApp:
         if key in ("x", "delete"):
             if job.active:
                 job.cancel()
-                self.say(f"cancelling {job.group.name} (partial file kept for resume)")
+                self.say(f"cancelling {job.group.name} (http partials resume next time; xet restarts)")
         elif key in ("p", "enter"):
             if job.status != "done":
                 self.say("the download hasn't finished yet")
@@ -319,13 +328,9 @@ class HubApp:
 
     def make_profile(self, job: hub.Job, name: str) -> None:
         assert job.path is not None
-        try:
-            model = str(job.path.resolve().relative_to(self.cfg.models_path().resolve())).replace("\\", "/")
-        except ValueError:
-            model = str(job.path)
-        prof = new_profile(name, model=model, description=f"from {job.repo}")
+        prof = new_profile(name, model=hub.model_ref(self.cfg, job.path), description=f"from {job.repo}")
         if job.mmproj_path:
-            prof.args["mmproj"] = str(job.mmproj_path)
+            prof.args["mmproj"] = hub.model_ref(self.cfg, job.mmproj_path)
         prof.save()
         job.profile = name
         self.say(f"✔ profile '{name}' saved — run it with: inari serve {name}")
@@ -510,7 +515,7 @@ class HubApp:
                           str(len(g.files)) if len(g.files) > 1 else "", local,
                           style=f"on {p.track}" if on and focused else "")
             body = t
-        sub = f" {len(self.groups)} files · → {hub.local_dir_for(hit.id, self.cfg)} "
+        sub = f" {len(self.groups)} files · → {hfcache.repo_dir(self.cfg, hit.id)} "
         files = self.panel(body, "Files", focused=focused, height=height - top_h, subtitle=sub)
         return Group(top, files)
 
@@ -536,9 +541,11 @@ class HubApp:
             name.append(j.group.name, style=f"bold {p.text}" if on else p.text)
             if j.mmproj:
                 name.append(" +mmproj", style=p.info)
-            if j.status == "downloading" and j.speed:
+            if j.status == "downloading" and j.via == "waiting":
+                note = Text("waiting — another process is downloading this file", style=p.warn)
+            elif j.status == "downloading" and j.speed:
                 eta = (j.total - j.done) / j.speed
-                note = Text(f"{hub.human(j.speed)}/s · {dur(eta)} left", style=p.accent2)
+                note = Text(f"{hub.human(j.speed)}/s · {dur(eta)} left · {j.via or j.backend}", style=p.accent2)
             elif j.status == "done":
                 note = Text(f"profile: {j.profile}" if j.profile else "p → make profile",
                             style=p.good if j.profile else p.accent2)
@@ -571,8 +578,8 @@ class HubApp:
             items = [("↑↓", "select"), ("Enter", "open"), ("/", "search"), ("o", "sort"), ("b", "browser"),
                      ("t", "theme"), ("q", "quit")]
         else:
-            items = [("↑↓", "select"), ("Enter", "download"), ("m", "mmproj"), ("Esc", "back"), ("b", "browser"),
-                     ("q", "quit")]
+            items = [("↑↓", "select"), ("Enter", "download"), ("m", "mmproj"), ("v", f"via {self.dl.backend}"),
+                     ("Esc", "back"), ("b", "browser"), ("q", "quit")]
         if self.dl.jobs and self.focus == "main" and not self.editing:
             items.insert(-1, ("Tab", "downloads"))
         t = Text()
@@ -588,7 +595,8 @@ class HubApp:
             t.append(self.flash[0], style=f"bold {p.accent2}")
             return t
         t.append("Hub", style=f"bold {p.accent}")
-        t.append(f"   |   models → {self.cfg.models_path()}", style=p.text)
+        t.append(f"   |   cache → {hfcache.cache_dir(self.cfg)}", style=p.text)
+        t.append(f"   |   via {self.dl.backend}", style=p.text)
         t.append("   |   token " + ("set" if hub._token(self.cfg) else "none (public repos only)"), style=p.text)
         if self.hits and self.screen == "search":
             t.append(f"   |   {len(self.hits)} repos", style=p.text)

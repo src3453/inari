@@ -16,6 +16,7 @@ from pathlib import Path
 
 import psutil
 
+from inari import hfcache
 from inari.config import Config, logs_dir, runs_dir
 from inari.profiles import Profile
 
@@ -88,6 +89,10 @@ def launch(profile: Profile, cfg: Config) -> tuple[RunInfo, subprocess.Popen]:
     cmd = profile.build_command(cfg)
     mp = profile.model_path(cfg)
     if mp is not None and not mp.exists() and "-hf" not in profile.args and "hf-repo" not in profile.args:
+        parsed = hfcache.parse_ref(profile.model)
+        if parsed:
+            raise FileNotFoundError(f"{profile.model} is not in the HF cache ({hfcache.cache_dir(cfg)}) — "
+                                    f"run: inari pull {parsed[0]}")
         raise FileNotFoundError(f"model not found: {mp}")
     if port_in_use(profile.host, profile.port):
         raise RuntimeError(f"port {profile.port} is already in use")
@@ -99,6 +104,8 @@ def launch(profile: Profile, cfg: Config) -> tuple[RunInfo, subprocess.Popen]:
     log_f.flush()
 
     env = dict(os.environ)
+    if cfg.hf_cache and "LLAMA_CACHE" not in env:
+        env["LLAMA_CACHE"] = str(hfcache.cache_dir(cfg))  # so -hf in llama-server shares inari's cache
     env.update(profile.env)
     kwargs: dict = {}
     if os.name == "nt":

@@ -5,7 +5,10 @@ Everything lives under ``$INARI_HOME`` (default: ``~/.inari``)::
     ~/.inari/
       config.toml      global settings (llama-server path, models dir, theme)
       profiles/*.toml  launch profiles
-      models/          downloaded GGUF files
+      models/          legacy download dir / hand-placed GGUF files
+
+Hub downloads go to the Hugging Face cache (``~/.cache/huggingface/hub`` by default), the same
+place llama.cpp's ``-hf`` uses — see :mod:`inari.hfcache`.
       runs/*.json      records of servers started by inari
       logs/*.log       llama-server output
 """
@@ -52,9 +55,11 @@ def config_path() -> Path:
 @dataclass
 class Config:
     llama_server: str = ""  # path to llama-server(.exe); empty = search PATH
-    models_dir: str = ""  # empty = ~/.inari/models
+    models_dir: str = ""  # empty = ~/.inari/models (legacy downloads, hand-placed GGUFs)
+    hf_cache: str = ""  # empty = same lookup as llama.cpp (LLAMA_CACHE, HF_HUB_CACHE, HF_HOME, ~/.cache/...)
     theme: str = "inari"
     hf_token: str = ""  # optional; HF_TOKEN env var also works
+    download_backend: str = "auto"  # auto | xet | http (auto: xet if hf_xet is installed; http resumes partials)
 
     @classmethod
     def load(cls) -> "Config":
