@@ -6,6 +6,7 @@ Everything lives under ``$INARI_HOME`` (default: ``~/.inari``)::
       config.toml      global settings (llama-server path, models dir, theme)
       profiles/*.toml  launch profiles
       models/          legacy download dir / hand-placed GGUF files
+      llama.cpp/       llama.cpp builds installed by ``inari update`` (see :mod:`inari.updater`)
 
 Hub downloads go to the Hugging Face cache (``~/.cache/huggingface/hub`` by default), the same
 place llama.cpp's ``-hf`` uses — see :mod:`inari.hfcache`.
@@ -60,6 +61,8 @@ class Config:
     theme: str = "kitsune"
     hf_token: str = ""  # optional; HF_TOKEN env var also works
     download_backend: str = "auto"  # auto | xet | http (auto: xet if hf_xet is installed; http resumes partials)
+    auto_update: str = "notify"  # llama.cpp updates: off | notify (daily check in the menu) | install (managed builds)
+    update_variant: str = ""  # llama.cpp build to download: cuda | rocm | vulkan | sycl | cpu | cuda-12.4 …; empty = auto
 
     @classmethod
     def load(cls) -> "Config":

@@ -30,8 +30,12 @@ llama.cpp の `llama-server` を、黄色基調の豪華なモニタリング TU
 
 ```bash
 uv sync
+uv run inari update             # llama.cpp が無ければ公式ビルドをダウンロードして使う（下記）
+# 自分のビルドを使う場合:
 uv run inari config set llama_server C:/llama.cpp/build/bin/llama-server.exe   # PATH に無い場合
 ```
+
+llama-server が見つからない状態でメインメニューを開くと、llama.cpp の公式ビルドを自動でダウンロードして設定します（`auto_update = "off"` のときはしません。メニューの `u` か `inari update` で入れられます）。
 
 NVIDIA GPU で負荷・温度・電力も見たいときは: `uv sync --extra nvidia`
 
@@ -140,6 +144,27 @@ uv run inari demo
 - モニタの **8 Models** タブ：`Enter` でロードしてそのモデルのモニタを表示、`u` でアンロード。表示中のモデルは、処理中または最後にロードされたモデルに自動で切り替わります（`m` で手動で次のモデルへ、`f` で自動追従に戻す）。Requests にはモデル名の列が付きます
 - 再接続は `inari monitor router`、停止は `inari stop router`（各モデルのプロセスもまとめて停止）。メインメニューでは `r` で起動・再接続できます
 - プロファイルの `host` / `port` は router では使われません。`LLAMA_ARG_*` 以外の `env` は router 全体に適用されます
+
+### llama.cpp の自動アップデート（`inari update`）
+
+[ggml-org/llama.cpp の Releases](https://github.com/ggml-org/llama.cpp/releases) にある公式ビルドを `~/.inari/llama.cpp/<ビルド>-<種類>/`（例: `b12421-cuda`）に並べてインストールし、`llama_server` をそこへ切り替えます。
+
+```bash
+uv run inari update             # 最新版を確認 → ダウンロード → 切り替え（確認あり）
+uv run inari update --check     # 確認だけ
+uv run inari update -y          # 確認なし（自分のビルドを使っている場合は --switch も付けると切り替える）
+uv run inari update --variant vulkan   # 種類を指定: cuda / rocm / vulkan / sycl / cpu / cuda-12.4 など
+```
+
+- **種類（variant）** は、使用中のビルドのバックエンド（`ggml-cuda` / `ggml-hip` / `ggml-vulkan` … の DLL）から自動判定。ビルドが無いときは NVIDIA GPU があれば CUDA（ドライバが対応する最新の CUDA 版）、無ければ Vulkan。`inari config set update_variant <種類>` で固定できます。Windows の CUDA 版は CUDA ランタイム（cudart）も一緒に入れます
+- **自動チェック**（`auto_update`）: メニューの `o` → Settings → llama.cpp updates、または `inari config set auto_update ...`
+  - `notify`（既定）: メインメニューを開いたときに 1 日 1 回確認し、新しいビルドがあればステータスバーに表示。`u` でインストール
+  - `install`: inari が入れたビルドを使っているなら、バックグラウンドで自動更新
+  - `off`: 確認しない
+  - どのモードでも（`off` 以外）、llama-server がまったく無ければ自動でインストール
+- 自分でビルド・配置した llama-server は勝手に置き換えません。`u` / `inari update` で切り替えるときは確認が出ます（元のビルドは残るので、Setup & models の step 1 で戻せます）
+- 動作中のサーバーは古いビルドのまま動き続けます（再起動すると新しいビルドを使います）。inari が入れたビルドは最新とひとつ前の 2 つを残し、それより古いものは削除します
+- GitHub API のレート制限に当たる場合は `GITHUB_TOKEN` を設定してください
 
 ### プロファイルの書式
 

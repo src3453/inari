@@ -277,7 +277,7 @@ def cmd_tune(a: argparse.Namespace) -> None:
     prof = load_profile(a.profile)
     binary = cfg.server_binary(prof.server_bin)
     if not binary:
-        die("llama-server not found — run: inari config set llama_server <path>")
+        die("llama-server not found — install it with: inari update  (or: inari config set llama_server <path>)")
     mp = prof.model_path(cfg)
     if not mp or not mp.exists():
         die(f"model not found: {prof.model}")
@@ -753,12 +753,82 @@ def cmd_demo(a: argparse.Namespace) -> None:
     run_monitor(DemoCollector(), managed=False)
 
 
+def cmd_update(a: argparse.Namespace) -> None:
+    import time
+
+    from inari import updater
+
+    with console.status("[accent]Looking for the newest llama.cpp release…[/]"):
+        try:
+            info = updater.latest(cfg, a.variant or "")
+        except Exception as e:
+            die(f"couldn't check for llama.cpp updates: {e}")
+    st = updater.load_state()
+    st["checked"], st["latest"] = time.time(), updater.asdict(info)
+    updater.save_state(st)
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(style="text")
+    cur = info.current_binary
+    t.add_row("in use", f"{'b' + str(info.current_build) if info.current_build else '—'}  [dim]{escape(cur or 'no llama-server found')}"
+                        f"{'  (managed by inari)' if info.managed else ''}[/]")
+    t.add_row("latest", f"[accent]{info.tag}[/]  [dim]{info.published[:10]}[/]")
+    t.add_row("build", f"{info.flavor}  [dim]({info.variant}{'' if a.variant or cfg.update_variant else ', auto-detected'}"
+                       f" · {hub.human(info.size)})[/]")
+    console.print(Panel(t, title="[accent] llama.cpp [/]", title_align="left", border_style="dim", box=box.ROUNDED))
+    if not info.available and not a.force:
+        console.print(f"[good]✔[/] up to date")
+        return
+    if a.check:
+        console.print(f"[accent2]{info.tag} is available[/] — run [accent]inari update[/] to install it")
+        return
+    switch_cfg = not cur or info.managed or not cfg.llama_server
+    if not a.yes:
+        q = f"Download {info.tag} ({hub.human(info.size)}) into {updater.install_root()}"
+        if cur and not info.managed:
+            console.print(f"[warn]![/] llama_server points at your own build; it stays on disk either way.")
+            switch_cfg = Confirm.ask(f"{q} and switch llama_server to it?", default=True, console=console)
+            if not switch_cfg and not Confirm.ask("Download it anyway (without switching)?", default=False, console=console):
+                return
+        elif not Confirm.ask(f"{q}?", default=True, console=console):
+            return
+    elif cur and not info.managed:
+        switch_cfg = a.switch
+    from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn, TransferSpeedColumn
+
+    with Progress(TextColumn("[accent]↓[/] [text]{task.description}[/]"), BarColumn(), DownloadColumn(),
+                  TransferSpeedColumn(), TimeRemainingColumn(), console=console, transient=True) as prog:
+        task = prog.add_task(info.tag, total=None)
+
+        def progress(label: str, done: int, total: int) -> None:
+            prog.update(task, description=label, completed=done, total=total or None)
+
+        try:
+            binary = updater.install(info, progress)
+        except Exception as e:
+            die(f"update failed: {e}")
+    changed = updater.switch(cfg, binary, force=switch_cfg)
+    removed = updater.prune(binary)
+    console.print(f"[good]✔[/] llama.cpp {info.tag} installed  [dim]{escape(binary)}[/]")
+    if changed:
+        console.print(f"  [dim]now using it: {', '.join(changed)}[/]")
+    else:
+        console.print(f"  [dim]llama_server unchanged — [/][accent]inari config set llama_server {escape(binary)}[/][dim] to use it[/]")
+    if removed:
+        console.print(f"  [dim]removed old builds: {', '.join(removed)}[/]")
+    if server.active_runs():
+        console.print("  [warn]![/] servers that are already running keep the old build until restarted")
+
+
 def cmd_config(a: argparse.Namespace) -> None:
     if a.action == "set":
         if not hasattr(cfg, a.key):
-            die(f"unknown key {a.key} (llama_server, models_dir, hf_cache, download_backend, theme, hf_token)")
+            die(f"unknown key {a.key} (llama_server, models_dir, hf_cache, download_backend, theme, hf_token, "
+                f"auto_update, update_variant)")
         if a.key == "download_backend" and a.value not in hub.BACKENDS:
             die(f"download_backend must be one of {', '.join(hub.BACKENDS)}")
+        if a.key == "auto_update" and a.value not in ("off", "notify", "install"):
+            die("auto_update must be one of off, notify, install")
         setattr(cfg, a.key, a.value)
         cfg.save()
     t = Table.grid(padding=(0, 2))
@@ -773,6 +843,8 @@ def cmd_config(a: argparse.Namespace) -> None:
     t.add_row("download_backend", f"{cfg.download_backend}  [dim]({', '.join(hub.BACKENDS)} · {xet})[/]")
     t.add_row("theme", f"{cfg.theme}  [dim]({', '.join(th.ORDER)})[/]")
     t.add_row("hf_token", "set" if cfg.hf_token else ("HF_TOKEN env" if os.environ.get("HF_TOKEN") else "—"))
+    t.add_row("auto_update", f"{cfg.auto_update}  [dim](off · notify · install — llama.cpp updates, see inari update)[/]")
+    t.add_row("update_variant", f"{cfg.update_variant or 'auto'}  [dim](cuda · rocm · vulkan · sycl · cpu · cuda-12.4 …)[/]")
     console.print(Panel(t, title="[accent] config [/]", title_align="left", border_style="dim", box=box.ROUNDED))
 
 
@@ -902,6 +974,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("demo", help="explore the monitor with a simulated server")
     s.set_defaults(fn=cmd_demo)
 
+    s = sub.add_parser("update", aliases=["upgrade"],
+                       help="install the newest official llama.cpp build (into ~/.inari/llama.cpp) and use it")
+    s.add_argument("--check", action="store_true", help="only show whether an update is available")
+    s.add_argument("--variant", metavar="V", help="cuda, rocm, vulkan, sycl, cpu or exact (cuda-12.4); default: config update_variant, "
+                                                  "else the backend of the build in use")
+    s.add_argument("-y", "--yes", action="store_true", help="no prompts")
+    s.add_argument("--switch", action="store_true",
+                   help="with -y: also switch llama_server when it points at your own build")
+    s.add_argument("-f", "--force", action="store_true", help="install even if the build in use isn't older")
+    s.set_defaults(fn=cmd_update)
+
     s = sub.add_parser("config", help="show or change global settings")
     cs = s.add_subparsers(dest="action")
     cs.add_parser("show")
@@ -1025,7 +1108,8 @@ def print_help() -> None:
                  ("tune PROFILE", "benchmark & pick the fastest GPU/batch/thread settings"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
                  ("cli [PROFILE]", "chat with a model in the terminal, like llama-cli"),
                  ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
-                 ("demo", "try the monitor with a simulated server"), ("config", "settings")):
+                 ("demo", "try the monitor with a simulated server"),
+                 ("update [--check]", "install the newest llama.cpp build"), ("config", "settings")):
         console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
     if not list_profiles():
         console.print()

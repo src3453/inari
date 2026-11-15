@@ -17,7 +17,7 @@ from rich import box
 from rich.align import Align
 from rich.panel import Panel
 
-from inari import server
+from inari import server, updater
 from inari import theme as th
 from inari.config import Config, config_path
 from inari.hubtui import window
@@ -44,7 +44,7 @@ ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded o
            ("import", "⇲ Import command", "paste a llama-server command line → profile"),
            ("hub", "↓ Hub", "search Hugging Face and download GGUFs"),
            ("demo", "▷ Demo", "try the monitor with a simulated server"),
-           ("settings", "⚙ Settings", "theme, download backend, Hugging Face token, llama-server path"),
+           ("settings", "⚙ Settings", "theme, download backend, Hugging Face token, llama.cpp updates"),
            ("quit", "× Quit", "")]
 TUNE_OPTIONS = [("balanced", "b", "Balanced", "quick · a typical chat request"),
                 ("gen", "g", "Generation", "quick · tokens/s while replying"),
@@ -66,6 +66,8 @@ TIPS = ["inari --help lists every command",
         "the http download backend resumes partial downloads (o → Settings)",
         "o → Settings → Theme previews every theme live",
         "o → Settings → Hugging Face token unlocks gated models in the hub",
+        "u installs the newest official llama.cpp build (inari update does the same)",
+        "o → Settings → llama.cpp updates: off · notify · install automatically",
         "inari demo shows the monitor with a simulated server",
         "learn about helping foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
 TIP_SECONDS = 20.0  # how long one tip stays before the next one
@@ -73,10 +75,11 @@ TIP_SECONDS = 20.0  # how long one tip stays before the next one
 
 class Settings:
     """The Settings panel of the main menu.
-    Rows: theme (opens the picker) · download backend · Hugging Face token (inline edit) · info."""
+    Rows: theme (opens the picker) · download backend · Hugging Face token (inline edit) · llama.cpp updates · info."""
 
-    ROWS = ("theme", "backend", "token", "server", "config")
-    EDITABLE = 3  # the first N rows can be changed here
+    ROWS = ("theme", "backend", "token", "updates", "server", "config")
+    EDITABLE = 4  # the first N rows can be changed here
+    CYCLE = (1, 3)  # rows changed with ←→
 
     def __init__(self) -> None:
         self.active = False
@@ -97,6 +100,17 @@ class Settings:
             return "not set (using HF_TOKEN env)", "Enter: paste a token  ·  huggingface.co/settings/tokens"
         return "not set", "Enter: paste a token  ·  huggingface.co/settings/tokens"
 
+    @staticmethod
+    def updates_note(cfg: Config) -> str:
+        bg = updater.background(cfg)
+        info = bg.info if bg else None
+        what = {"off": "never checks", "notify": "daily check, tells you",
+                "install": "daily check + install"}.get(cfg.auto_update, "")
+        if info:
+            have = f"b{info.current_build}" if info.current_build else "none"
+            return f"←→ {what}  ·  {have} in use · {info.tag} latest  ·  u: update"
+        return f"←→ {what}  ·  u: check & update now"
+
     def render(self, p: th.Palette, cfg: Config) -> RenderableType:
         from inari.hub import BACKENDS
 
@@ -109,15 +123,16 @@ class Settings:
         rows = [("Theme", cfg.theme, "Enter: choose with a live preview"),
                 ("Download backend", backend, "←→: auto · xet · http (http resumes partials)"),
                 ("Hugging Face token", token, token_note),
+                ("llama.cpp updates", cfg.auto_update, self.updates_note(cfg)),
                 ("llama-server", cfg.server_binary() or "not found", "change it in + Setup & models (step 1)"),
                 ("Config file", str(config_path()), "all settings: inari config show / set")]
         for i, (label, val, note) in enumerate(rows):
             on = i == self.sel
             editable = i < self.EDITABLE
             v = Text()
-            v.append("‹ " if on and i == 1 else "  " if i == 1 else "", style=p.accent)
+            v.append("‹ " if on and i in self.CYCLE else "  " if i in self.CYCLE else "", style=p.accent)
             v.append(val, style=f"bold {p.accent2}" if on and editable else (p.text if editable else p.dim))
-            v.append(" ›" if on and i == 1 else "", style=p.accent)
+            v.append(" ›" if on and i in self.CYCLE else "", style=p.accent)
             t.add_row(Text("▶" if on else "", style=f"bold {p.accent}"),
                       Text(label, style=f"bold {p.accent}" if on else p.text), v)
             t.add_row("", "", Text(note, style=p.dim))
@@ -159,6 +174,7 @@ class Menu:
         self.flash = (flash, time.monotonic() + 4) if flash else ("", 0.0)
         self.tips = random.sample(TIPS, len(TIPS))  # shuffled once; rotates every TIP_SECONDS
         self.tips_t0 = time.monotonic()
+        self.updates = updater.background(cfg)  # daily llama.cpp check (once per process)
         self.refresh()
         if select:
             self.sel = next((i for i, r in enumerate(self.rows) if r.name == select), self.sel)
@@ -267,6 +283,9 @@ class Menu:
         if key == "o":
             self.open_settings()
             return None
+        if key == "u":
+            self.ask_update()
+            return None
         if key.isdigit() and key != "0":
             i = int(key) - 1
             if i < len(self.profiles()):
@@ -344,6 +363,17 @@ class Menu:
             self.cfg.download_backend = BACKENDS[(BACKENDS.index(cur) + d) % len(BACKENDS)]
             self.cfg.save()
             self.say(f"download backend: {self.cfg.download_backend}")
+        elif Settings.ROWS[s.sel] == "updates" and key in ("enter", " ", "right", "left", "l", "h"):
+            modes = updater.MODES
+            cur = self.cfg.auto_update if self.cfg.auto_update in modes else "notify"
+            d = -1 if key in ("left", "h") else 1
+            self.cfg.auto_update = modes[(modes.index(cur) + d) % len(modes)]
+            self.cfg.save()
+            self.updates = updater.background(self.cfg)  # turning checks on starts one now
+            self.say(f"llama.cpp updates: {self.cfg.auto_update}")
+        elif key == "u":
+            s.active = False
+            self.ask_update()
         elif Settings.ROWS[s.sel] == "token" and key in ("enter", " ", "right", "l"):
             s.editing = True
             s.buf = ""
@@ -353,6 +383,34 @@ class Menu:
             self.say("Hugging Face token cleared")
         return None
 
+    def ask_update(self) -> None:
+        """u: install the newest llama.cpp (asks first), or look for one when nothing is known yet."""
+        bg = self.updates = updater.background(self.cfg, create=True)
+        assert bg
+        if bg.busy:
+            self.say(bg.status())
+            return
+        info = bg.info
+        if not self.cfg.server_binary():  # nothing installed: u is the install button
+            bg.start_check(self.cfg, force=True, install_after=True)
+            return
+        if not info or not info.available:
+            bg.start_check(self.cfg, force=True)
+            return
+        p = self.p
+        lines = [Text.assemble(("Install llama.cpp ", p.text), (info.tag, f"bold {p.accent}"), ("?", p.text)), Text(""),
+                 Text.assemble(("build     ", p.dim), (f"{info.flavor}  ({info.variant})", p.text)),
+                 Text.assemble(("download  ", p.dim), (f"{info.size / 1e6:,.0f} MB", p.text)),
+                 Text.assemble(("into      ", p.dim), (str(updater.install_root() / info.dirname), p.text)),
+                 Text.assemble(("in use    ", p.dim), (f"b{info.current_build}" if info.current_build else "—", p.text),
+                               (f"  {info.current_binary}" if info.current_binary else "", p.dim))]
+        if info.current_binary and not info.managed:
+            lines += [Text(""), Text("llama-server will switch to this official build. Your current build stays "
+                                     "on disk (Setup & models step 1 switches back).", style=p.warn)]
+        lines += [Text(""), Text("Downloads in the background — keep using the menu.", style=p.dim)]
+        self.modal.open("Update llama.cpp", lines, lambda: bg.start_install(self.cfg, force=True),
+                        ok_label="Install", danger=False)
+
     def ask_tune(self, row: Row) -> None:
         if row.error:
             self.say(f"can't read {row.name}: {row.error}")
@@ -361,7 +419,7 @@ class Menu:
         elif row.missing:
             self.say(f"model file for {row.name} is missing — e to pick another, h to download")
         elif not self.has_bin:
-            self.say("llama-server not found — + Setup & models walks you through setting it up")
+            self.say("llama-server not found — u installs llama.cpp, + Setup & models sets your own")
         else:
             p = self.p
             lines = [Text.assemble(("Auto-tune ", p.text), (row.name, f"bold {p.accent}")),
@@ -507,8 +565,16 @@ class Menu:
         msg, until = self.flash
         if msg and time.monotonic() < until:
             return Text(" " + msg, style=p.accent2)
+        bg = self.updates
+        if bg and (bg.busy or bg.offer) and bg.status():
+            return Text(" " + bg.status(), style=p.accent2)
+        if bg and bg.message and bg.message != bg.shown:  # a result: show it like a flash, once
+            bg.shown = bg.message
+            self.flash = (bg.message, time.monotonic() + 8)
+            return Text(" " + bg.message, style=p.warn if bg.error else p.accent2)
         if not self.has_bin:
-            return Text(" llama-server not found — + Setup & models walks you through setting it up", style=p.warn)
+            return Text(" llama-server not found — u installs the official llama.cpp build · "
+                        "n sets the path to your own", style=p.warn)
         tip = self.tips[int((time.monotonic() - self.tips_t0) // TIP_SECONDS) % len(self.tips)]
         return Text.assemble((" Tip ", f"bold {p.accent}"), (tip, p.dim))
 
@@ -523,6 +589,10 @@ class Menu:
                 items.append(("x", "stop"))
             else:
                 items.append(("d", "delete"))
+        if not self.has_bin and not (self.updates and self.updates.busy):
+            items.append(("u", "install llama.cpp"))
+        elif self.updates and self.updates.offer:
+            items.append(("u", "update llama.cpp"))
         items += [("r", "router"), ("n", "setup & models"), ("i", "import"), ("h", "hub"), ("o", "settings"), ("q", "quit")]
         t = Text()
         for key, label in items:
