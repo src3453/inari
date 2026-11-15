@@ -69,7 +69,9 @@ TIPS = ["inari --help lists every command",
         "u installs the newest official llama.cpp build (inari update does the same)",
         "o → Settings → llama.cpp updates: off · notify · install automatically",
         "inari demo shows the monitor with a simulated server",
-        "learn about helping foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
+        "learn about helping foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with me)",
+        "visit my website!: https://sites.google.com/view/kitsunekoworks"
+        ]
 TIP_SECONDS = 20.0  # how long one tip stays before the next one
 
 
