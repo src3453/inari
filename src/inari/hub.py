@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -21,6 +21,9 @@ from rich import box
 
 from inari import hfcache
 from inari.config import Config
+
+if TYPE_CHECKING:
+    from rich.progress import Progress
 
 SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
 QUANT_RE = re.compile(
@@ -118,13 +121,110 @@ def _noop(*_a: object) -> None:
     return None
 
 
+class RateMeter:
+    """Bytes/s over a sliding window. Thread-safe; decays to 0 when bytes stop arriving."""
+
+    def __init__(self, window: float = 4.0) -> None:
+        import threading
+        from collections import deque
+
+        self.window = window
+        self.total = 0
+        self._samples: deque[tuple[float, int]] = deque()  # (time, cumulative bytes)
+        self._base: tuple[float, int] | None = None  # last sample that slid out of the window
+        self._lock = threading.Lock()
+
+        self._last = 0.0  # time of the last add
+
+    def start(self) -> None:
+        """A new transfer: measure from its first byte, so setup time (metadata, connecting) isn't averaged in."""
+        with self._lock:
+            self._samples.clear()
+            self._base = None
+
+    def add(self, n: int) -> None:
+        if n <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self.total += n
+            self._last = now
+            if self._base is None:  # first chunk only starts the clock (it took unknown time to arrive)
+                self._base = (now, self.total)
+                return
+            self._samples.append((now, self.total))
+            self._prune(now)
+
+    def idle(self) -> float:
+        """Seconds since bytes last arrived (inf if none yet)."""
+        return time.monotonic() - self._last if self._last else float("inf")
+
+    def _prune(self, now: float) -> None:
+        while self._samples and now - self._samples[0][0] > self.window:
+            self._base = self._samples.popleft()
+
+    def rate(self) -> float:
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            if self._base is None:
+                return 0.0
+            t0, b0 = self._base
+            span = now - t0
+            return (self.total - b0) / span if span > 0.3 else 0.0
+
+
+class Speed:
+    """Download speed: network bytes when the backend reports them, else bytes written."""
+
+    def __init__(self) -> None:
+        self.net = RateMeter()  # steady (HTTP chunks, Xet transfer reports)
+        self.disk = RateMeter()  # Xet flushes these in bursts; only a fallback for old huggingface_hub
+        self._base = self._size = self._net0 = 0
+        self._started = (0, 0)
+
+    def start(self, base: int = 0, size: int = 0) -> None:
+        """A file's transfer begins. ``base``: bytes done before it; ``size``: its size."""
+        self.net.start()
+        self.disk.start()
+        self._base, self._size, self._net0 = base, size, self.net.total
+        self._started = (self.net.total, self.disk.total)
+
+    def rate(self) -> float:
+        return self.net.rate() if self.net.total else self.disk.rate()
+
+    def stalled(self, after: float = 3.0) -> bool:
+        """Bytes were flowing for the current file, then none for ``after`` seconds."""
+        flowing = (self.net.total, self.disk.total) != self._started
+        return flowing and min(self.net.idle(), self.disk.idle()) > after
+
+    def shown(self, done: int) -> int:
+        """Bytes to display. Xet writes to disk well after receiving, so count received bytes too."""
+        got = self.net.total - self._net0
+        if self._size:
+            got = min(got, self._size)
+        return max(done, self._base + got)
+
+
+def _dur(sec: float) -> str:
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
 @dataclass
 class FetchCtl:
     """Hooks a fetch reports through (TUI job, rich progress bar, ...)."""
 
-    progress: Callable[[int], None] = _noop  # bytes added
+    progress: Callable[[int], None] = _noop  # file bytes completed by this fetch
     cancelled: Callable[[], bool] = lambda: False
     status: Callable[[str], None] = _noop  # "xet" | "http" | "waiting"
+    transfer: Callable[[int], None] = _noop  # bytes received over the network (drives the speed)
+    skip: Callable[[int], None] | None = None  # bytes already on disk (progress, but not speed)
+
+    def have(self, n: int) -> None:
+        (self.skip or self.progress)(n)
 
 
 def xet_available() -> bool:
@@ -158,11 +258,11 @@ def fetch_file(cfg: Config, repo: str, group: GgufGroup, fn: str, backend: str, 
     oid, size = group.oids[fn], group.sizes.get(fn, 0)
     snap = snapshot_path(cfg, repo, group, fn)
     if snap.is_file():
-        ctl.progress(snap.stat().st_size)
+        ctl.have(snap.stat().st_size)
         return snap
     legacy = local_dir_for(repo, cfg) / fn
     if legacy.is_file():
-        ctl.progress(legacy.stat().st_size)
+        ctl.have(legacy.stat().st_size)
         return legacy
 
     rdir = hfcache.repo_dir(cfg, repo)
@@ -170,11 +270,11 @@ def fetch_file(cfg: Config, repo: str, group: GgufGroup, fn: str, backend: str, 
         with hfcache.BlobLock(cfg, repo, oid, keep_waiting=lambda: not ctl.cancelled(),
                               on_wait=lambda: ctl.status("waiting")):
             if snap.is_file():  # another process finished it while we waited
-                ctl.progress(snap.stat().st_size)
+                ctl.have(snap.stat().st_size)
             else:
                 blob = hfcache.blob_path(cfg, repo, oid)
                 if blob.is_file():
-                    ctl.progress(blob.stat().st_size)
+                    ctl.have(blob.stat().st_size)
                 else:
                     blob.parent.mkdir(parents=True, exist_ok=True)
                     via = pick_backend(cfg, repo, oid, backend)
@@ -213,17 +313,18 @@ def _fetch_http(cfg: Config, repo: str, group: GgufGroup, fn: str, blob: Path, c
                       timeout=httpx.Timeout(30.0, read=120.0)) as r:
         if have and r.status_code == 416:  # already complete
             os.replace(part, blob)
-            ctl.progress(have)
+            ctl.have(have)
             return
         r.raise_for_status()
         if have and r.status_code != 206:  # server ignored Range -> start over
             have = 0
-        ctl.progress(have)
+        ctl.have(have)
         with open(part, "ab" if have else "wb") as f:
             for chunk in r.iter_bytes(1 << 20):
                 if ctl.cancelled():
                     raise Cancelled()
                 f.write(chunk)
+                ctl.transfer(len(chunk))
                 ctl.progress(len(chunk))
     os.replace(part, blob)
 
@@ -256,20 +357,34 @@ def _fetch_xet(cfg: Config, repo: str, group: GgufGroup, fn: str, blob: Path, ct
 
     aborted = [False]
 
-    class _Bar(tqdm):  # receives xet's "bytes written" updates; never draws
+    def _check_cancel() -> bool:
+        # runs inside hf_xet's progress callback: raising here only prints a traceback to stderr,
+        # so cancel by aborting the session and let xet_get fail on its own
+        if ctl.cancelled():
+            if not aborted[0]:
+                aborted[0] = True
+                abort_xet_session()
+            return True
+        return False
+
+    class _Bar(tqdm):  # receives xet's progress updates; never draws
         def __init__(self, **kw: object) -> None:
             kw["disable"] = True
             super().__init__(**kw)  # type: ignore[arg-type]
 
         def update(self, n: float | None = 1) -> bool | None:
-            # runs inside hf_xet's progress callback: raising here only prints a traceback to stderr,
-            # so cancel by aborting the session and let xet_get fail on its own
-            if ctl.cancelled():
-                if not aborted[0]:
-                    aborted[0] = True
-                    abort_xet_session()
-                return None
-            ctl.progress(int(n or 0))
+            # bytes written to the file: flushed in bursts, so it only drives the % done
+            if not _check_cancel():
+                ctl.progress(int(n or 0))
+            return None
+
+        # Having these makes huggingface_hub route network bytes here too (instead of dropping them).
+        # They arrive steadily, so they drive the speed.
+        def update_transfer(self, n: float | None = 1) -> None:
+            if not _check_cancel():
+                ctl.transfer(int(n or 0))
+
+        def set_transfer_postfix_str(self, *_a: object, **_kw: object) -> None:
             return None
 
     tmp = blob.with_name(f"{blob.name}.xet.{os.getpid()}.incomplete")
@@ -289,27 +404,65 @@ def _fetch_xet(cfg: Config, repo: str, group: GgufGroup, fn: str, blob: Path, ct
 
 
 def download_group(repo: str, group: GgufGroup, cfg: Config, console: Console, backend: str = "") -> Path:
-    from rich.progress import (BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn,
-                               TransferSpeedColumn)
+    from rich.progress import BarColumn, DownloadColumn, Progress, ProgressColumn, Task, TextColumn
+    from rich.text import Text
+
+    meters: dict[int, Speed] = {}
+
+    class SpeedColumn(ProgressColumn):  # rich's own speed counts resumed bytes as if just downloaded
+        def render(self, task: Task) -> Text:
+            m = meters.get(task.id)
+            if m is None or task.finished:
+                return Text("")
+            r = m.rate()
+            left = f" · {_dur(task.remaining / r)}" if r and task.remaining is not None else ""
+            return Text(f"{human(r)}/s{left}" if r else "—", style="progress.data.speed")
 
     backend = backend or cfg.download_backend
     first: Path | None = None
     files = sorted(group.files)
     with Progress(TextColumn("[accent]↓[/] [text]{task.description}[/]"), BarColumn(),
-                  DownloadColumn(), TransferSpeedColumn(), TimeRemainingColumn(),
+                  DownloadColumn(), SpeedColumn(),
                   TextColumn("[dim]{task.fields[via]}[/]"), console=console) as prog:
         for i, fn in enumerate(files, 1):
             tag = f" [{i}/{len(files)}]" if len(files) > 1 else ""
             task = prog.add_task(fn + tag, total=group.sizes.get(fn) or None, via="")
-
-            def status(st: str, t=task) -> None:
-                prog.update(t, via="waiting for another download…" if st == "waiting" else st)
-
-            ctl = FetchCtl(progress=lambda n, t=task: prog.advance(t, n), status=status)
+            meters[task] = speed = Speed()
+            ctl = _bar_ctl(prog, task, speed, group.sizes.get(fn, 0))
             path = fetch_file(cfg, repo, group, fn, backend, ctl)
             first = first or path
     assert first is not None
     return first
+
+
+def _bar_ctl(prog: Progress, task: int, speed: Speed, size: int) -> FetchCtl:
+    """FetchCtl driving one rich progress task (one file)."""
+    done = 0
+
+    def show() -> None:
+        prog.update(task, completed=speed.shown(done))
+
+    def status(st: str) -> None:
+        if st in ("xet", "http"):
+            speed.start(size=size)
+        prog.update(task, via="waiting for another download…" if st == "waiting" else st)
+
+    def progress(n: int) -> None:
+        nonlocal done
+        speed.disk.add(n)
+        done += n
+        show()
+
+    def skip(n: int) -> None:
+        nonlocal done
+        done += n
+        show()
+
+    def transfer(n: int) -> None:
+        speed.net.add(n)
+        show()
+
+    return FetchCtl(progress=progress, status=status, transfer=transfer, skip=skip)
 
 
 def pull(spec: str, cfg: Config, console: Console, *, yes: bool = False,
@@ -586,12 +739,17 @@ class Job:
     error: str = ""
     path: Path | None = None
     mmproj_path: Path | None = None
-    speed: float = 0.0  # bytes/s (EWMA)
     current: str = ""
     profile: str = ""  # profile created from this job
     backend: str = "auto"  # requested: auto | xet | http
     via: str = ""  # what the current file is using: xet | http | waiting
     _cancel: bool = field(default=False, repr=False)
+    _speed: Speed = field(default_factory=Speed, repr=False)
+
+    @property
+    def speed(self) -> float:
+        """Bytes/s over the last few seconds (0 when stalled or not downloading)."""
+        return self._speed.rate() if self.status == "downloading" and self.via != "waiting" else 0.0
 
     @property
     def total(self) -> int:
@@ -599,7 +757,16 @@ class Job:
 
     @property
     def frac(self) -> float:
-        return self.done / self.total if self.total else 0.0
+        return self.shown / self.total if self.total else 0.0
+
+    @property
+    def shown(self) -> int:
+        """Bytes to display: on disk, or received but not yet written (Xet), whichever is further."""
+        return min(self.total, self._speed.shown(self.done)) if self.status == "downloading" else self.done
+
+    @property
+    def stalled(self) -> bool:
+        return self.status == "downloading" and self.via != "waiting" and self._speed.stalled()
 
     @property
     def active(self) -> bool:
@@ -643,11 +810,11 @@ class Downloader:
                 job.path = self._group(job, job.group)
                 if job.mmproj:
                     job.mmproj_path = self._group(job, job.mmproj)
-                job.status, job.speed, job.current, job.via = "done", 0.0, "", ""
+                job.status, job.current, job.via = "done", "", ""
             except Cancelled:
-                job.status, job.speed = "cancelled", 0.0
+                job.status = "cancelled"
             except Exception as e:  # network / auth / disk
-                job.status, job.error, job.speed = "failed", str(e) or type(e).__name__, 0.0
+                job.status, job.error = "failed", str(e) or type(e).__name__
 
     def _group(self, job: Job, group: GgufGroup) -> Path:
         first: Path | None = None
@@ -659,18 +826,19 @@ class Downloader:
 
     def _file(self, job: Job, group: GgufGroup, fn: str) -> Path:
         job.current = fn
-        state = {"t": time.monotonic(), "b": float(job.done)}
 
         def progress(n: int) -> None:
             job.done += n
-            now = time.monotonic()
-            if now - state["t"] >= 0.5:
-                rate = (job.done - state["b"]) / (now - state["t"])
-                job.speed = rate if not job.speed else job.speed * 0.6 + rate * 0.4
-                state["t"], state["b"] = now, float(job.done)
+            job._speed.disk.add(n)
+
+        def skip(n: int) -> None:
+            job.done += n
 
         def status(st: str) -> None:
+            if st in ("xet", "http"):  # don't average in metadata / lock-wait time
+                job._speed.start(base=job.done, size=group.sizes.get(fn, 0))
             job.via = st
 
         return fetch_file(self.cfg, job.repo, group, fn, job.backend,
-                          FetchCtl(progress=progress, cancelled=lambda: job._cancel, status=status))
+                          FetchCtl(progress=progress, cancelled=lambda: job._cancel, status=status,
+                                   transfer=job._speed.net.add, skip=skip))
