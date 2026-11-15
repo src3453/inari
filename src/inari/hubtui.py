@@ -20,6 +20,7 @@ from inari import theme as th
 from inari.config import Config
 from inari.keys import KeyReader
 from inari.profiles import NAME_RE, Profile, new_profile
+from inari.themepick import ThemePicker
 from inari.tui import Bar, dur, k
 
 
@@ -52,11 +53,12 @@ def window(sel: int, n: int, rows: int) -> tuple[int, int]:
 
 
 class HubApp:
-    def __init__(self, cfg: Config, console: Console, *, query: str = "", theme_name: str = "inari") -> None:
+    def __init__(self, cfg: Config, console: Console, *, query: str = "", theme_name: str = "kitsune") -> None:
         self.cfg = cfg
         self.console = console
         self.theme_name = theme_name
         self.p = th.get(theme_name)
+        self.picker = ThemePicker()
         self.dl = hub.Downloader(cfg)
 
         self.screen = "search"  # search | files
@@ -172,6 +174,12 @@ class HubApp:
                     j.cancel()
                 return True
             return False
+        if self.picker.active:
+            if self.picker.handle(key) == "pick":
+                self.theme_name = self.picker.name
+                self.say(f"theme: {self.theme_name}")
+            self.p = th.get(self.picker.name)
+            return False
         if self.naming is not None:
             return self.key_naming(key)
         if self.editing:
@@ -183,8 +191,7 @@ class HubApp:
                 return False
             return True
         if key == "t":
-            self.theme_name = th.next_name(self.theme_name)
-            self.p = th.get(self.theme_name)
+            self.picker.open(self.theme_name)
             return False
         if key == "v":
             order = hub.BACKENDS
@@ -343,7 +350,8 @@ class HubApp:
         parts = [
             Layout(self.header(), size=2),
             Layout(Text("─" * w, style=self.p.dim), size=1),
-            Layout(self.view_search(body_h) if self.screen == "search" else self.view_files(body_h), size=body_h),
+            Layout(self.picker.render(self.p) if self.picker.active else
+                   self.view_search(body_h) if self.screen == "search" else self.view_files(body_h), size=body_h),
         ]
         if jobs_h:
             parts.append(Layout(self.view_downloads(jobs_h), size=jobs_h))

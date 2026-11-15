@@ -19,6 +19,7 @@ from inari import theme as th
 from inari.collector import STATES, Collector, Snapshot
 from inari.keys import KeyReader
 from inari.logparse import Request, line_level
+from inari.themepick import ThemePicker
 
 VIEWS = ["Overview", "Serving", "Requests", "Engine", "Hardware", "Logs", "Connect"]
 ROUTER_VIEWS = VIEWS + ["Models"]  # router mode adds a model list (load / unload / focus)
@@ -90,12 +91,13 @@ class Spark:
 
 # ───────────────────────── app ─────────────────────────
 class App:
-    def __init__(self, collector: Collector, *, theme_name: str = "inari", managed: bool = False,
+    def __init__(self, collector: Collector, *, theme_name: str = "kitsune", managed: bool = False,
                  console: Console | None = None) -> None:
         self.c = collector
         self.console = console or Console(highlight=False)
         self.theme_name = theme_name
         self.p = th.get(theme_name)
+        self.picker = ThemePicker()
         self.managed = managed
         self.view = 0
         self.frozen = False
@@ -136,6 +138,12 @@ class App:
         self.flash = (msg, time.monotonic() + 2.5)
 
     def handle(self, key: str) -> bool:
+        if self.picker.active:
+            if self.picker.handle(key) == "pick":
+                self.theme_name = self.picker.name
+                self.say(f"theme: {self.theme_name}")
+            self.p = th.get(self.picker.name)
+            return False
         if self.filter_mode:
             if key in ("enter", "esc"):
                 if key == "esc":
@@ -179,9 +187,7 @@ class App:
             self.c.poke()
             self.say("refreshed")
         elif key == "t":
-            self.theme_name = th.next_name(self.theme_name)
-            self.p = th.get(self.theme_name)
-            self.say(f"theme: {self.theme_name}")
+            self.picker.open(self.theme_name)
         elif key == "b":
             webbrowser.open(self.snap.url)
             self.say(f"opened {self.snap.url}")
@@ -304,6 +310,8 @@ class App:
         return root
 
     def body(self, height: int) -> RenderableType:
+        if self.picker.active:
+            return self.picker.render(self.p)
         if self.help:
             return self.view_help()
         return [self.view_overview, self.view_serving, self.view_requests, self.view_engine,
@@ -769,7 +777,7 @@ class App:
         t.add_column(style=p.text)
         rows = [("1 … 8  ← →  Tab" if self.router else "1 … 7  ← →  Tab", "switch view"), ("/", "filter (logs: text, requests: status/task id)"),
                      ("Esc", "clear filter / close help"), ("Space", "freeze / unfreeze the display"),
-                     ("r", "refresh now"), ("t", "cycle theme (inari · amber · lemon · kitsune)"),
+                     ("r", "refresh now"), ("t", "pick a theme (with preview)"),
                      ("b", "open the llama.cpp web UI"), ("↑ ↓ PgUp PgDn End", "scroll logs / requests"),
                      ("q", "quit (managed servers: keep serving or stop)"), ("?", "toggle this help")]
         if self.router:

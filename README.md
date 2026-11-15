@@ -146,7 +146,7 @@ GGML_VK_VISIBLE_DEVICES = "0"
 | `/` | フィルタ（Logs: 文字列, Requests: ステータス・タスク ID） |
 | `Space` | 表示を一時停止 |
 | `r` | 即時更新 |
-| `t` | テーマ切替（inari / amber / lemon / kitsune） |
+| `t` | テーマ選択（説明とカラープレビュー付き。↑↓ で即プレビュー、Enter で決定、Esc で戻す）: kitsune（既定）/ sora 水色 / matcha 緑 / sumi モノクロ / washi ライト端末用 |
 | `b` | llama.cpp の Web UI をブラウザで開く |
 | `↑` `↓` `PgUp` `PgDn` `End` | ログ・リクエストのスクロール |
 | `q` | 終了（管理中サーバーは「停止 / 動かしたまま」を選択） |

@@ -57,7 +57,7 @@ class Config:
     llama_server: str = ""  # path to llama-server(.exe); empty = search PATH
     models_dir: str = ""  # empty = ~/.inari/models (legacy downloads, hand-placed GGUFs)
     hf_cache: str = ""  # empty = same lookup as llama.cpp (LLAMA_CACHE, HF_HUB_CACHE, HF_HOME, ~/.cache/...)
-    theme: str = "inari"
+    theme: str = "kitsune"
     hf_token: str = ""  # optional; HF_TOKEN env var also works
     download_backend: str = "auto"  # auto | xet | http (auto: xet if hf_xet is installed; http resumes partials)
 

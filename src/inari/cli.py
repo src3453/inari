@@ -30,9 +30,7 @@ from inari.profiles import Profile, list_profiles, new_profile  # noqa: E402
 cfg = Config.load()
 console = th.make_console(cfg.theme)
 
-BANNER = r"""[accent]  ╦╔╗╔╔═╗╦═╗╦[/]
-[accent]  ║║║║╠═╣╠╦╝║[/]   [dim]llama.cpp, served golden[/]
-[accent]  ╩╝╚╝╩ ╩╩╚═╩[/]   [dim]v{v}[/]"""
+
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -466,6 +464,7 @@ def cmd_config(a: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="inari", description="Golden TUI wrapper for llama.cpp's llama-server")
     ap.add_argument("-V", "--version", action="version", version=f"inari {__version__}")
+    ap.add_argument("--nologo", action="store_true", help="show the logo as plain ASCII text")
     sub = ap.add_subparsers(dest="cmd")
 
     s = sub.add_parser("setup", aliases=["onboard", "wizard"],
@@ -569,6 +568,10 @@ def main(argv: list[str] | None = None) -> None:
             a.pairs += unknown
         else:
             ap.error(f"unrecognized arguments: {' '.join(unknown)}")
+    if a.nologo:
+        from inari import inari_logo
+
+        inari_logo.ascii_only = True
     if not getattr(a, "fn", None):
         if sys.stdin.isatty() and sys.stdout.isatty():
             return main_menu()
@@ -634,7 +637,9 @@ def main_menu() -> None:
 
 
 def print_help() -> None:
-    console.print(BANNER.format(v=__version__))
+    from inari.inari_logo import banner
+
+    console.print(banner(th.get(cfg.theme), console))
     console.print()
     for c, d in (("", "main menu: pick a profile to serve, or set one up"),
                  ("setup [PROFILE]", "guided setup wizard (start here)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),

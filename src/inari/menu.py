@@ -11,12 +11,14 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
-from inari import __version__, server
+from inari import server
 from inari import theme as th
 from inari.config import Config
 from inari.hubtui import window
+from inari.inari_logo import banner
 from inari.keys import KeyReader
 from inari.profiles import Profile, list_profiles
+from inari.themepick import ThemePicker
 
 
 @dataclass
@@ -45,6 +47,7 @@ class Menu:
         self.cfg = cfg
         self.console = console
         self.p = th.get(cfg.theme)
+        self.picker = ThemePicker()
         self.rows: list[Row] = []
         self.sel = 0
         self.confirm: tuple[str, str, str] | None = None  # (question, action, name)
@@ -105,6 +108,14 @@ class Menu:
         self.flash = (msg, time.monotonic() + 3.5)
 
     def handle(self, key: str) -> tuple[str, str] | None:
+        if self.picker.active:
+            if self.picker.handle(key) == "pick" and self.picker.name != self.cfg.theme:
+                self.cfg.theme = self.picker.name
+                self.cfg.save()
+                self.console.push_theme(th.rich_theme(th.get(self.cfg.theme)))  # [accent] etc. in later prints
+                self.say(f"theme: {self.cfg.theme}")
+            self.p = th.get(self.picker.name)
+            return None
         if key in ("ctrl+c", "q", "Q"):
             return ("quit", "")
         if self.confirm:
@@ -128,6 +139,9 @@ class Menu:
             return ("hub", "")
         if key == "r":
             return ("router", "")
+        if key == "t":
+            self.picker.open(self.cfg.theme)
+            return None
         if key.isdigit() and key != "0":
             i = int(key) - 1
             if i < len(self.profiles()):
@@ -169,22 +183,14 @@ class Menu:
         root.split_column(
             Layout(self.header(), size=4),
             Layout(Text("─" * w, style=p.dim), size=1),
-            Layout(self.body(body_h), size=body_h),
+            Layout(self.picker.render(p) if self.picker.active else self.body(body_h), size=body_h),
             Layout(self.status(), size=1),
             Layout(self.hints(), size=2),
         )
         return root
 
     def header(self) -> RenderableType:
-        p = self.p
-        art = ["╦╔╗╔╔═╗╦═╗╦", "║║║║╠═╣╠╦╝║", "╩╝╚╝╩ ╩╩╚═╩"]
-        side = ["", "llama.cpp, served golden", f"v{__version__}"]
-        g = Table.grid(padding=(0, 3))
-        g.add_column(no_wrap=True)
-        g.add_column(no_wrap=True)
-        for a, s in zip(art, side):
-            g.add_row(Text("  " + a, style=f"bold {p.accent}"), Text(s, style=p.dim))
-        return g
+        return banner(self.p, self.console)
 
     def body(self, h: int) -> RenderableType:
         p = self.p
@@ -255,7 +261,7 @@ class Menu:
             items.append(("e", "edit (setup)"))
             if row.running:
                 items.append(("x", "stop"))
-        items += [("r", "router"), ("n", "new profile"), ("h", "hub"), ("q", "quit")]
+        items += [("r", "router"), ("n", "new profile"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
         t = Text()
         for key, label in items:
             t.append(key, style=f"bold {p.accent}")

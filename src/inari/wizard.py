@@ -113,7 +113,7 @@ def free_port(skip: str = "") -> int:
 
 
 class Wizard:
-    def __init__(self, cfg: Config, console: Console, *, name: str = "", theme_name: str = "inari",
+    def __init__(self, cfg: Config, console: Console, *, name: str = "", theme_name: str = "kitsune",
                  start: str = "") -> None:
         self.cfg = cfg
         self.console = console
