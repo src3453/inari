@@ -488,7 +488,7 @@ class HubApp:
             info.append(f"{label} ", style=p.dim)
             info.append(f"{value}   ", style=f"bold {p.text}")
         if hit.gated:
-            info.append("gated: accept the license on the website and set hf_token", style=p.warn)
+            info.append("gated: accept the license on the website, then set a Hugging Face token (menu o → Settings)", style=p.warn)
         proj = self.projector()
         mm = Text()
         if proj:

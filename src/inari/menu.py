@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded o
            ("import", "⇲ Import command", "paste a llama-server command line → profile"),
            ("hub", "↓ Hub", "search Hugging Face and download GGUFs"),
            ("demo", "▷ Demo", "try the monitor with a simulated server"),
-           ("settings", "⚙ Settings", "theme, download backend, llama-server path"),
+           ("settings", "⚙ Settings", "theme, download backend, Hugging Face token, llama-server path"),
            ("quit", "× Quit", "")]
 TUNE_OPTIONS = [("balanced", "b", "Balanced", "quick · a typical chat request"),
                 ("gen", "g", "Generation", "quick · tokens/s while replying"),
@@ -64,19 +65,37 @@ TIPS = ["inari --help lists every command",
         "x stops a running profile — the monitor isn't needed to keep it serving",
         "the http download backend resumes partial downloads (o → Settings)",
         "o → Settings → Theme previews every theme live",
+        "o → Settings → Hugging Face token unlocks gated models in the hub",
         "inari demo shows the monitor with a simulated server",
         "learn about helping foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
 TIP_SECONDS = 20.0  # how long one tip stays before the next one
 
 
 class Settings:
-    """The Settings panel of the main menu. Rows: theme (opens the picker) · download backend · info."""
+    """The Settings panel of the main menu.
+    Rows: theme (opens the picker) · download backend · Hugging Face token (inline edit) · info."""
 
-    ROWS = ("theme", "backend", "server", "config")
+    ROWS = ("theme", "backend", "token", "server", "config")
+    EDITABLE = 3  # the first N rows can be changed here
 
     def __init__(self) -> None:
         self.active = False
         self.sel = 0
+        self.editing = False  # typing a new Hugging Face token
+        self.buf = ""
+
+    @staticmethod
+    def mask(token: str) -> str:
+        return f"{token[:3]}{'•' * 8}{token[-4:]}" if len(token) > 10 else "•" * len(token)
+
+    def token_value(self, cfg: Config) -> tuple[str, str]:
+        if self.editing:
+            return (self.mask(self.buf) if self.buf else "") + "▏", "Enter: save (empty clears)  ·  Esc: cancel"
+        if cfg.hf_token:
+            return self.mask(cfg.hf_token), "Enter: replace  ·  Del: clear  ·  for gated / private repos"
+        if os.environ.get("HF_TOKEN"):
+            return "not set (using HF_TOKEN env)", "Enter: paste a token  ·  huggingface.co/settings/tokens"
+        return "not set", "Enter: paste a token  ·  huggingface.co/settings/tokens"
 
     def render(self, p: th.Palette, cfg: Config) -> RenderableType:
         from inari.hub import BACKENDS
@@ -86,13 +105,15 @@ class Settings:
         t.add_column(no_wrap=True, min_width=18)
         t.add_column(no_wrap=True, overflow="ellipsis")
         backend = cfg.download_backend if cfg.download_backend in BACKENDS else "auto"
+        token, token_note = self.token_value(cfg)
         rows = [("Theme", cfg.theme, "Enter: choose with a live preview"),
                 ("Download backend", backend, "←→: auto · xet · http (http resumes partials)"),
+                ("Hugging Face token", token, token_note),
                 ("llama-server", cfg.server_binary() or "not found", "change it in + Setup & models (step 1)"),
                 ("Config file", str(config_path()), "all settings: inari config show / set")]
         for i, (label, val, note) in enumerate(rows):
             on = i == self.sel
-            editable = i < 2
+            editable = i < self.EDITABLE
             v = Text()
             v.append("‹ " if on and i == 1 else "  " if i == 1 else "", style=p.accent)
             v.append(val, style=f"bold {p.accent2}" if on and editable else (p.text if editable else p.dim))
@@ -100,8 +121,13 @@ class Settings:
             t.add_row(Text("▶" if on else "", style=f"bold {p.accent}"),
                       Text(label, style=f"bold {p.accent}" if on else p.text), v)
             t.add_row("", "", Text(note, style=p.dim))
-        hint = Text.assemble(("↑↓", f"bold {p.accent}"), (" choose   ", p.dim), ("Enter", f"bold {p.accent}"),
-                             (" change   ", p.dim), ("Esc", f"bold {p.accent}"), (" back", p.dim))
+        if self.editing:
+            hint = Text.assemble(("type / paste", f"bold {p.accent}"), (" the token (hf_…)   ", p.dim),
+                                 ("Enter", f"bold {p.accent}"), (" save   ", p.dim),
+                                 ("Esc", f"bold {p.accent}"), (" cancel", p.dim))
+        else:
+            hint = Text.assemble(("↑↓", f"bold {p.accent}"), (" choose   ", p.dim), ("Enter", f"bold {p.accent}"),
+                                 (" change   ", p.dim), ("Esc", f"bold {p.accent}"), (" back", p.dim))
         body = Table.grid()
         body.add_row(t)
         body.add_row(Text(""))
@@ -272,12 +298,36 @@ class Menu:
     def open_settings(self) -> None:
         self.settings.active = True
         self.settings.sel = 0
+        self.settings.editing = False
+
+    def key_token(self, key: str) -> None:
+        """Typing a Hugging Face token in Settings — every key goes to the field."""
+        s = self.settings
+        if key == "esc":
+            s.editing = False
+        elif key == "enter":
+            s.editing = False
+            tok = s.buf.strip()
+            if tok == self.cfg.hf_token:
+                return
+            self.cfg.hf_token = tok
+            self.cfg.save()
+            self.say("✔ Hugging Face token saved" if tok else "Hugging Face token cleared")
+        elif key == "backspace":
+            s.buf = s.buf[:-1]
+        elif key == "ctrl+c":
+            s.buf = ""
+        elif len(key) == 1 and key.isprintable() and not key.isspace():
+            s.buf += key
 
     def key_settings(self, key: str) -> tuple[str, str] | None:
         from inari.hub import BACKENDS
 
         s = self.settings
         n = len(Settings.ROWS)
+        if s.editing:
+            self.key_token(key)
+            return None
         if key in ("esc", "q", "Q", "o", "b"):
             s.active = False
         elif key == "ctrl+c":
@@ -294,6 +344,13 @@ class Menu:
             self.cfg.download_backend = BACKENDS[(BACKENDS.index(cur) + d) % len(BACKENDS)]
             self.cfg.save()
             self.say(f"download backend: {self.cfg.download_backend}")
+        elif Settings.ROWS[s.sel] == "token" and key in ("enter", " ", "right", "l"):
+            s.editing = True
+            s.buf = ""
+        elif Settings.ROWS[s.sel] == "token" and key in ("delete", "backspace") and self.cfg.hf_token:
+            self.cfg.hf_token = ""
+            self.cfg.save()
+            self.say("Hugging Face token cleared")
         return None
 
     def ask_tune(self, row: Row) -> None:
