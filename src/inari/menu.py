@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass
 
@@ -48,6 +49,24 @@ TUNE_OPTIONS = [("balanced", "b", "Balanced", "quick · a typical chat request")
                 ("gen", "g", "Generation", "quick · tokens/s while replying"),
                 ("prompt", "p", "Prompt", "quick · tokens/s reading the prompt"),
                 ("thorough", "t", "Thorough", "balanced · up to 24 runs, ×2 each")]
+TIPS = ["inari --help lists every command",
+        "press 1–9 to jump straight to a profile",
+        "t on a profile auto-tunes GPU layers, batch and threads for speed",
+        "c on a profile opens a terminal chat — type / for its commands",
+        "in chat, /think shows or hides the model's reasoning",
+        "in chat, /regen answers your last message again",
+        "in chat, /system sets a system prompt for a fresh conversation",
+        "⇄ Router serves every profile from one port and loads models on demand",
+        "⇲ Import turns an existing llama-server command line into a profile",
+        "inari pull repo:QUANT downloads a GGUF without opening the hub",
+        "inari profile set NAME ctx-size=32768 changes a profile from the shell",
+        "inari ps lists running servers; inari stop NAME stops one",
+        "x stops a running profile — the monitor isn't needed to keep it serving",
+        "the http download backend resumes partial downloads (o → Settings)",
+        "o → Settings → Theme previews every theme live",
+        "inari demo shows the monitor with a simulated server",
+        "help foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
+TIP_SECONDS = 20.0  # how long one tip stays before the next one
 
 
 class Settings:
@@ -112,6 +131,8 @@ class Menu:
         self.sel = 0
         self.confirm: tuple[str, str, str] | None = None  # (question, action, name)
         self.flash = (flash, time.monotonic() + 4) if flash else ("", 0.0)
+        self.tips = random.sample(TIPS, len(TIPS))  # shuffled once; rotates every TIP_SECONDS
+        self.tips_t0 = time.monotonic()
         self.refresh()
         if select:
             self.sel = next((i for i, r in enumerate(self.rows) if r.name == select), self.sel)
@@ -431,7 +452,8 @@ class Menu:
             return Text(" " + msg, style=p.accent2)
         if not self.has_bin:
             return Text(" llama-server not found — + Setup & models walks you through setting it up", style=p.warn)
-        return Text(" inari --help lists every command", style=p.dim)
+        tip = self.tips[int((time.monotonic() - self.tips_t0) // TIP_SECONDS) % len(self.tips)]
+        return Text.assemble((" Tip ", f"bold {p.accent}"), (tip, p.dim))
 
     def hints(self) -> RenderableType:
         p = self.p
