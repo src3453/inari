@@ -43,6 +43,11 @@ llama-server → モデル（`Enter` でこのプロファイルに使用、`h` 
 - **Advanced** は、設定済み llama-server の `--help` から読み取った全フラグを `Default`（llama.cpp 既定）/ `Tuned`（inari の推奨）/ `Yours`（あなたの値）で一覧表示。`/` 絞り込み、`x` experimental のみ、`Enter` 編集、`←→` 選択肢切替、`Del` リセット、`a` 名前で追加、`c` コマンドをコピー、`u` Tuned 値の適用 on/off
 - **Tuned** は `llama-server --list-devices` の VRAM と GGUF メタデータ（学習時コンテキスト長、層数、MoE など）から計算
 - `--help` の解析結果はビルドごとに `~/.inari/cache/` にキャッシュ
+- **Auto-tune**（Context 以降のステップで `t`）は、Tuned の推測ではなく**実測**で決めます。llama-optimus / llama-dyno などのチューナーと同じく候補設定を試して速いものを残しますが、`llama-bench` ではなくこのプロファイルの `llama-server` コマンドそのもの（コンテキスト長・KV キャッシュ型・並列スロット・mmproj 込み）で起動して計測するので、本番のコンテキストで VRAM が足りない候補はここで落ち、数値も実際の serve と同じになります
+  - 試す順番: 現在の設定（ベースライン）と llama.cpp の `--fit on` → GPU 配置（密モデルは `-ngl`、MoE は `--n-cpu-moe` を、ロード失敗時は CPU 側へ退避しつつ刻み幅を半分にしていく山登りで探索）→ `--ubatch-size` / `--batch-size` → `--threads`（CPU が計算に関わるときだけ）→（thorough のみ）配置を ±1 で再確認
+  - Goal: `balanced`（2K プロンプト + 256 トークン応答の 1 リクエスト/分）/ `gen`（生成 tok/s）/ `prompt`（プロンプト処理 tok/s）。Depth: `quick`（最大 10 回起動）/ `thorough`（最大 24 回・各 2 回計測）
+  - 結果は表で表示され、`Enter` で適用（`measured` として表示）。コンテキスト長と KV キャッシュ型は品質に関わるので変更しません。サーバー出力は `~/.inari/logs/autotune-<name>.log`
+  - 既存プロファイルはコマンドラインからも: `uv run inari tune qwen3-8b [--goal gen] [--thorough] [-y]`
 
 ### 既存の llama-server コマンドから取り込む
 

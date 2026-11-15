@@ -24,7 +24,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from inari import argspec, hub, tuning
+from inari import argspec, autotune, hub, server, tuning
 from inari import theme as th
 from inari.argspec import ArgSpec, Catalog
 from inari.config import Config
@@ -167,6 +167,11 @@ class Wizard:
         self.result: Result | None = None
         self.exit_reason = ""
         self.dirty = seed is not None
+        # auto-tune (benchmark) panel
+        self.tune_open = False
+        self.tuner: autotune.Tuner | None = None
+        self.tune_goal, self.tune_depth, self.tune_sel = "balanced", "quick", 2
+        self.measured: dict[str, str] = {}  # key -> why (set by auto-tune)
 
     # ───────── model / profile state ─────────
     def _scan_models(self) -> list[hub.LocalModel]:
@@ -221,7 +226,7 @@ class Wizard:
 
     def source(self, key: str) -> str:
         if key in self.mine:
-            return "yours"
+            return "measured" if key in self.measured else "yours"
         if self.apply_tuned and key in self.tuned:
             return "tuned"
         return "default"
@@ -234,6 +239,7 @@ class Wizard:
     def set_value(self, key: str, v: Any) -> None:
         """Set a setting; picking the tuned value or the default drops the override."""
         self.dirty = True
+        self.measured.pop(key, None)
         if v is DEFAULT:
             if self.apply_tuned and key in self.tuned:
                 self.mine[key] = None
@@ -246,6 +252,7 @@ class Wizard:
 
     def reset(self, key: str) -> None:
         self.dirty = True
+        self.measured.pop(key, None)
         self.mine.pop(key, None)
 
     def profile(self) -> Profile:
@@ -467,16 +474,19 @@ class Wizard:
         with KeyReader() as keys, Live(console=self.console, screen=True, auto_refresh=False,
                                        redirect_stdout=False, redirect_stderr=False) as live:
             last = 0.0
-            while True:
-                pressed = keys.drain()
-                for key in pressed:
-                    if self.handle(key):
-                        return self.exit_reason or "done"
-                now = time.monotonic()
-                if pressed or now - last >= 0.5:
-                    live.update(self.render(), refresh=True)
-                    last = now
-                time.sleep(0.03)
+            try:
+                while True:
+                    pressed = keys.drain()
+                    for key in pressed:
+                        if self.handle(key):
+                            return self.exit_reason or "done"
+                    now = time.monotonic()
+                    if pressed or now - last >= 0.5:
+                        live.update(self.render(), refresh=True)
+                        last = now
+                    time.sleep(0.03)
+            finally:
+                self.stop_tuner()
 
     def say(self, msg: str) -> None:
         self.flash = (msg, time.monotonic() + 3.5)
@@ -516,7 +526,12 @@ class Wizard:
             return act() if key in ("y", "Y", "enter") else False
         if self.input:
             return self.key_input(key)
+        if self.tune_open:
+            return self.key_tune(key)
         step = STEPS[self.step][0]
+        if key == "t" and step not in ("server", "model", "name"):
+            self.open_tune()
+            return False
         if key == "tab":
             self.cmd_scroll += 1
             return False
@@ -534,6 +549,131 @@ class Wizard:
         handler = {"server": self.key_server, "model": self.key_model, "advanced": self.key_advanced,
                    "review": self.key_review}.get(step, self.key_form)
         return handler(key)
+
+    # ───────── auto-tune (benchmark) ─────────
+    def open_tune(self) -> None:
+        if not self.binary:
+            self.say("set llama-server first")
+        elif not self.model or not self.model_path or not self.model_path.exists():
+            self.say("pick a model that is on disk first")
+        else:
+            self.tune_open = True
+
+    def stop_tuner(self) -> None:
+        t = self.tuner
+        if t is not None and not t.done:
+            t.cancel()
+            end = time.monotonic() + 15
+            while not t.done and time.monotonic() < end:
+                time.sleep(0.1)
+
+    def start_tuner(self) -> None:
+        prof = self.profile()
+        prof.name = self.name or "new"
+        binary = self.cfg.server_binary(self.server_bin) or self.binary or ""
+        self.tuner = autotune.Tuner(self.cfg, self.cat, self.hw, self.info, self.model_size, prof, binary=binary,
+                                    goal=self.tune_goal, depth=self.tune_depth)
+        self.tuner.start()
+
+    def apply_tuner(self) -> None:
+        t = self.tuner
+        best = t.best if t else None
+        if t is None or best is None:
+            return
+        ch = t.changes()
+        g = t.gain()
+        why = (f"auto-tune: prompt {best.pp:,.0f} · gen {best.tg:,.1f} tok/s"
+               + (f" ({g:+.0%} vs before)" if g is not None else ""))
+        for k, v in ch.items():
+            if v is None:
+                self.measured.pop(k, None)
+                if self.apply_tuned and k in self.tuned:
+                    self.mine[k] = None
+                else:
+                    self.mine.pop(k, None)
+            else:
+                self.mine[k] = v
+                self.measured[k] = why
+        self.dirty = True
+        self.say(f"✔ applied {len(ch)} measured setting(s): {best.label}" if ch
+                 else "✔ your current settings were already the fastest")
+
+    def key_tune(self, key: str) -> bool:
+        t = self.tuner
+        if t is not None and not t.done:
+            if key in ("esc", "q", "t"):
+                t.cancel()
+                self.say("cancelling — stopping the test server…")
+            return False
+        if t is not None:  # finished
+            if key in ("enter", "a") and t.best is not None:
+                self.apply_tuner()
+                self.tuner, self.tune_open = None, False
+            elif key == "r":
+                self.tuner = None
+            elif key in ("esc", "q", "b"):
+                self.tuner, self.tune_open = None, False
+            return False
+        if key in ("esc", "q", "b"):
+            self.tune_open = False
+        elif key in ("up", "k", "down", "j"):
+            self.tune_sel = self.nav(key, self.tune_sel, 3)
+        elif key in ("left", "right", "h", "l", " ") and self.tune_sel < 2:
+            d = -1 if key in ("left", "h") else 1
+            if self.tune_sel == 0:
+                goals = list(autotune.GOALS)
+                self.tune_goal = goals[(goals.index(self.tune_goal) + d) % len(goals)]
+            else:
+                depths = list(autotune.DEPTHS)
+                self.tune_depth = depths[(depths.index(self.tune_depth) + d) % len(depths)]
+        elif key == "s" or (key == "enter" and self.tune_sel == 2):
+            self.start_tuner()
+        elif key == "enter":
+            self.key_tune("right")
+        return False
+
+    def view_tune(self, h: int) -> RenderableType:
+        p = self.p
+        if self.tuner is not None:
+            parts: list[RenderableType] = [autotune.render(self.tuner, p, rows=max(h - 6, 3))]
+            if self.tuner.done and self.tuner.best is not None:
+                ch = self.tuner.changes()
+                parts.append(Text("changes: " + ("  ".join(f"--{k} {'(default)' if v is None else show(v)}"
+                                                          for k, v in ch.items()) or "none"), style=p.accent2))
+            return Group(*parts)
+        t = Table.grid(padding=(0, 2))
+        t.add_column(width=1, no_wrap=True)
+        t.add_column(no_wrap=True, min_width=8)
+        t.add_column(no_wrap=True, min_width=14)
+        t.add_column(style=p.dim, overflow="ellipsis", no_wrap=True)
+        rows = [("Goal", self.tune_goal, autotune.GOALS[self.tune_goal]),
+                ("Depth", self.tune_depth, f"up to {autotune.DEPTHS[self.tune_depth]} server starts"
+                 + (" · 2 measurements each" if self.tune_depth == "thorough" else "")),
+                ("", "▶ Start", "")]
+        for i, (label, val, note) in enumerate(rows):
+            on = i == self.tune_sel
+            v = Text()
+            if i < 2:
+                v.append("‹ " if on else "  ", style=p.accent)
+                v.append(val, style=f"bold {p.accent2}" if on else p.text)
+                v.append(" ›" if on else "  ", style=p.accent)
+            else:
+                v.append(val, style=f"bold {p.accent}" if on else p.text)
+            t.add_row(Text("▸" if on else " ", style=p.accent), Text(label, style=p.text), v, note,
+                      style=f"on {p.track}" if on else "")
+        info = Text()
+        info.append("Starts llama-server with this profile's own command (context, KV cache, slots …), times a "
+                    "long prompt and a reply, and tries other GPU-layer / MoE-on-CPU placements, micro-batch "
+                    "sizes and CPU thread counts — like llama-optimus / llama-dyno, but with the real server.\n",
+                    style=p.text)
+        info.append("Each run reloads the model, so a big model takes a few minutes in total. "
+                    "Context length and KV cache type stay as you set them.", style=p.dim)
+        parts = [self.title("Auto-tune", "measure instead of guess"), Text(""), t, Text(""), info]
+        busy = server.active_runs()
+        if busy:
+            parts += [Text(""), Text(f"⚠ running now: {', '.join(r.name for r in busy)} — it uses GPU memory, "
+                                     "so stop it for accurate results", style=p.warn)]
+        return Group(*parts)
 
     def key_input(self, key: str) -> bool:
         inp = self.input
@@ -822,6 +962,8 @@ class Wizard:
 
     def body(self, h: int) -> RenderableType:
         step = STEPS[self.step][0]
+        if self.tune_open:
+            return self.view_tune(h)
         if step == "server":
             return self.view_server()
         if step == "model":
@@ -924,7 +1066,8 @@ class Wizard:
             val.append("‹ " if on and fd.options else "  ", style=p.accent)
             val.append_text(shown)
             val.append(" ›" if on and fd.options else "", style=p.accent)
-            tag = {"yours": ("yours", p.accent), "tuned": ("tuned", p.good), "default": ("", p.dim)}[src]
+            tag = {"yours": ("yours", p.accent), "tuned": ("tuned", p.good), "measured": ("measured", p.good),
+                   "default": ("", p.dim)}[src]
             t.add_row(Text("▸" if on else " ", style=p.accent),
                       Text(fd.label, style=f"bold {p.text}" if on else p.text), val,
                       Text(tag[0] if not fd.key.startswith("@") else "", style=tag[1]),
@@ -1044,8 +1187,9 @@ class Wizard:
                 break
             src = self.source(k)
             lines.add_row(f"--{k}", Text(show(v), style=f"bold {p.text}"),
-                          Text(src + (f" · {self.why[k]}" if src == "tuned" and k in self.why else ""),
-                               style=p.good if src == "tuned" else p.dim))
+                          Text(src + (f" · {self.why[k]}" if src == "tuned" and k in self.why else "")
+                               + (f" · {self.measured[k]}" if src == "measured" else ""),
+                               style=p.good if src in ("tuned", "measured") else p.dim))
             shown += 1
         if not eff:
             lines.add_row("", Text("everything at llama.cpp defaults", style=p.dim), "")
@@ -1080,6 +1224,9 @@ class Wizard:
                                  ("▌", p.accent))
         if self.flash and time.monotonic() < self.flash[1]:
             return Text(self.flash[0], style=f"bold {p.accent2}", no_wrap=True, overflow="ellipsis")
+        if self.tune_open:
+            return Text(f"server output: {self.tuner.log_path}" if self.tuner else " ", style=p.dim,
+                        no_wrap=True, overflow="ellipsis")
         step = STEPS[self.step][0]
         key, label, help_ = "", "", ""
         if step == "advanced":
@@ -1098,14 +1245,24 @@ class Wizard:
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append(f"{label}: ", style=p.dim)
         t.append(help_, style=p.dim)
-        if key in self.why and self.apply_tuned:
+        if key in self.measured:
+            t.append(f"  ·  {self.measured[key]}", style=p.good)
+        elif key in self.why and self.apply_tuned:
             t.append(f"  ·  tuned: {self.why[key]}", style=p.good)
         return t
 
     def hints(self) -> RenderableType:
         p = self.p
         step = STEPS[self.step][0]
-        if self.input:
+        if self.tune_open and not self.input:
+            tn = self.tuner
+            if tn is None:
+                items = [("↑↓", "choose"), ("←→", "change"), ("Enter", "start"), ("Esc", "close")]
+            elif not tn.done:
+                items = [("Esc", "cancel")]
+            else:
+                items = ([("Enter", "apply")] if tn.best else []) + [("r", "again"), ("Esc", "discard")]
+        elif self.input:
             items = [("Enter", "ok"), ("Esc", "cancel"), ("Ctrl+U", "clear")]
             if step == "advanced":
                 items.append(("empty", "= reset"))
@@ -1117,13 +1274,15 @@ class Wizard:
         elif step == "advanced":
             items = [("n", "next"), ("↑↓", "choose"), ("Enter", "edit"), ("←→", "cycle"), ("Esc", "back"),
                      ("Del", "reset"), ("x", "experimental"), ("/", "filter"), ("a", "add by name"),
-                     ("u", "tuned on/off"), ("c", "copy command"), ("Tab", "scroll command")]
+                     ("u", "tuned on/off"), ("t", "auto-tune"), ("c", "copy command"), ("Tab", "scroll command")]
         elif step == "review":
-            items = [("Enter", "save"), ("s", "save & serve"), ("u", "tuned on/off"), ("c", "copy command"),
+            items = [("Enter", "save"), ("s", "save & serve"), ("t", "auto-tune"), ("u", "tuned on/off"),
+                     ("c", "copy command"),
                      ("Esc", "back"), ("q", "quit")]
         else:
             items = [("n", "next"), ("↑↓", "choose"), ("←→", "change"), ("Enter", "type a value"),
-                     ("Del", "reset"), ("Esc", "back"), ("c", "copy command"), ("q", "quit")]
+                     ("Del", "reset"), ("Esc", "back")] + ([("t", "auto-tune")] if step != "name" else []) + [
+                     ("c", "copy command"), ("q", "quit")]
         t = Text()
         for key, label in items:
             t.append(key, style=f"bold {p.accent}")

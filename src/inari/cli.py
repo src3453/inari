@@ -264,6 +264,69 @@ def cmd_profile(a: argparse.Namespace) -> None:
 
 
 # ───────────────────────── setup wizard ─────────────────────────
+def cmd_tune(a: argparse.Namespace) -> None:
+    """Benchmark candidate settings for a profile with the real llama-server and keep the fastest."""
+    import time
+
+    from rich.live import Live
+
+    from inari import argspec, autotune, tuning
+    from inari.gguf import read_info
+
+    prof = load_profile(a.profile)
+    binary = cfg.server_binary(prof.server_bin)
+    if not binary:
+        die("llama-server not found — run: inari config set llama_server <path>")
+    mp = prof.model_path(cfg)
+    if not mp or not mp.exists():
+        die(f"model not found: {prof.model}")
+    if server.find_run(prof.name):
+        die(f"{prof.name} is running — stop it first (inari stop {prof.name}) so the GPU memory is free")
+    others = server.active_runs()
+    if others:
+        console.print(f"[warn]⚠ other servers are running ({', '.join(r.name for r in others)}) — they use GPU "
+                      "memory and CPU, so the results will be off. Stop them for best results.[/]")
+    with console.status("[accent]Reading llama-server settings and devices…[/]"):
+        cat = argspec.load(cfg, binary)
+        hw = tuning.detect(binary)
+    size = next((m.size for m in hub.local_models(cfg) if m.ref == prof.model), 0) or mp.stat().st_size
+    tuner = autotune.Tuner(cfg, cat, hw, read_info(mp), size, prof, binary=binary, goal=a.goal,
+                           depth="thorough" if a.thorough else "quick")
+    console.print(f"[dim]devices: {hw.describe()} · up to {tuner.max_trials} server starts · "
+                  f"log: {tuner.log_path}[/]")
+    p = th.get(cfg.theme)
+    tuner.start()
+    try:
+        with Live(autotune.render(tuner, p, rows=40), console=console, refresh_per_second=4) as live:
+            while not tuner.done:
+                time.sleep(0.25)
+                live.update(autotune.render(tuner, p, rows=40))
+            live.update(autotune.render(tuner, p, rows=40))
+    except KeyboardInterrupt:
+        tuner.cancel()
+        console.print("[dim]cancelling…[/]")
+        while not tuner.done:
+            time.sleep(0.2)
+    console.print()
+    ch = tuner.changes()
+    if tuner.best is None or not ch:
+        console.print("[dim]nothing to change — the profile is already the fastest of what was tried[/]"
+                      if tuner.best else "[bad]no candidate ran successfully[/]")
+        return
+    console.print("changes: " + "  ".join(f"[accent2]--{k}[/] {'(default)' if v is None else v}"
+                                          for k, v in ch.items()))
+    if a.yes or Confirm.ask(f"[accent]Save these to profile {prof.name}?[/]", console=console, default=True):
+        vals = argspec.from_args(prof.args, cat)
+        for k, v in ch.items():
+            if v is None:
+                vals.pop(k, None)
+            else:
+                vals[k] = v
+        prof.args = argspec.to_args(vals, cat)
+        prof.save()
+        console.print(f"[good]✔ saved[/] [accent]{prof.name}[/]")
+
+
 def cmd_setup(a: argparse.Namespace) -> None:
     from inari.wizard import run_wizard
 
@@ -625,6 +688,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-a", "--advanced", action="store_true", help="open the all-settings table directly")
     s.set_defaults(fn=cmd_setup)
 
+    s = sub.add_parser("tune", aliases=["autotune"],
+                       help="benchmark settings for a profile with the real llama-server and keep the fastest")
+    s.add_argument("profile")
+    s.add_argument("-g", "--goal", choices=["balanced", "gen", "prompt"], default="balanced",
+                   help="what to optimize (default: balanced = a typical chat request)")
+    s.add_argument("--thorough", action="store_true", help="more candidates and repeats (slower)")
+    s.add_argument("-y", "--yes", action="store_true", help="save the result without asking")
+    s.set_defaults(fn=cmd_tune)
+
     s = sub.add_parser("import", help="turn an existing llama-server command into a profile (downloads -hf models)")
     s.add_argument("command", nargs=argparse.REMAINDER,
                    help='the command, quoted or as-is: inari import llama-server -hf unsloth/Qwen3-8B-GGUF -c 32768 '
@@ -818,7 +890,8 @@ def print_help() -> None:
                  ("setup [PROFILE]", "setup & models wizard: new profile, manage local models (start here)"),
                  ("import [COMMAND]", "llama-server command → profile (+ model download)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
                  ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
-                 ("profile new|set|show|ls", "save llama-server arguments"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
+                 ("profile new|set|show|ls", "save llama-server arguments"),
+                 ("tune PROFILE", "benchmark & pick the fastest GPU/batch/thread settings"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
                  ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
                  ("demo", "try the monitor with a simulated server"), ("config", "settings")):
         console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
