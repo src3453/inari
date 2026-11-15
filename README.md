@@ -108,7 +108,7 @@ uv run inari demo
 - 応答はトークン単位で表示し、推論モデルの思考（`reasoning_content`）は薄い色で表示（`--no-think` / `/think` で非表示）。応答ごとに生成トークン数・tok/s・プロンプト処理速度を表示
 - `Ctrl+C` で生成を中断、空のプロンプトで `Ctrl+C` か `Ctrl+D` / `/exit` で終了。行末 `\` または `"""` で囲むと複数行入力
 - `/` を入力するとコマンド候補が表示されます（↑↓ で選択、Tab / Enter で確定）
-- コマンド：`/clear`（会話をリセットして画面もクリア）、`/regen`（最後の応答を再生成）、`/undo`（最後のやり取りを削除）、`/system テキスト`（システムプロンプト設定）、`/think`、`/md`（Markdown 表示の切替）、`/info`、`/help`
+- コマンド：`/clear`（会話をリセットして画面もクリア）、`/regen`（最後の応答を再生成）、`/undo`（最後のやり取りを削除）、`/system テキスト`（システムプロンプト設定）、`/think`、`/effort`（思考予算：`2048`・`8k`・`low`/`medium`/`high`/`max`・`off`・`auto`）、`/md`（Markdown 表示の切替）、`/info`、`/help`
 - オプション：`-s/--system`、`--temp`、`-n/--n-predict`（1 応答の最大トークン）、`-p/--prompt`（1 回だけ答えて終了）、`--port`、`--url URL [-m MODEL]`（任意の起動中 llama-server と会話）
 - プロファイル名を省略すると一覧から選択（単体で動いているサーバーが 1 つだけならそれを使用）
 

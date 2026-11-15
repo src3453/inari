@@ -29,6 +29,7 @@ HELP = [("/help", "this list"),
         ("/undo", "drop the last exchange"),
         ("/system [TEXT]", "show or set the system prompt (starts a new conversation)"),
         ("/think", "show / hide the model's reasoning"),
+        ("/effort [N]", "thinking budget: tokens, low/medium/high, off, or auto (server default)"),
         ("/md", "Markdown rendering on / off (plain text)"),
         ("/info", "model, server and conversation size"),
         ("/exit", "leave (also /quit, /bye, Ctrl+D, Ctrl+C at an empty prompt)"),
@@ -41,10 +42,12 @@ COMMANDS = [("/help", "list the commands"),
             ("/undo", "drop the last exchange"),
             ("/system ", "show or set the system prompt"),
             ("/think", "show / hide the model's reasoning"),
+            ("/effort ", "thinking budget (tokens, low/medium/high, off, auto)"),
             ("/md", "Markdown rendering on / off"),
             ("/info", "model, server and conversation size"),
             ("/exit", "leave")]
 ALIASES = {"/new": "/clear", "/reset": "/clear", "/retry": "/regen", "/markdown": "/md", "/plain": "/md",
+           "/budget": "/effort",
            "/quit": "/exit", "/bye": "/exit", "/q": "/exit", "/?": "/help"}
 
 
@@ -310,6 +313,41 @@ class Reply:
     seconds: float = 0.0
 
 
+EFFORT_LEVELS = {"low": 1024, "medium": 4096, "med": 4096, "high": 16384, "max": -2}
+
+
+def parse_effort(arg: str) -> int | None:
+    """``/effort`` argument → thinking budget in tokens. None = server default, 0 = thinking off,
+    -2 = unlimited. Accepts ``4096``, ``4k``, ``low/medium/high/max``, ``off``, ``auto``. ValueError if unknown."""
+    a = arg.strip().lower().replace(",", "").replace("_", "")
+    if a in ("auto", "default", "server", "-1"):
+        return None
+    if a in ("off", "none", "0", "no"):
+        return 0
+    if a in ("unlimited", "inf", "max"):
+        return -2
+    if a in EFFORT_LEVELS:
+        return EFFORT_LEVELS[a]
+    mult = 1
+    if a.endswith("k"):
+        a, mult = a[:-1], 1024
+    n = int(float(a) * mult)
+    if n < 0:
+        raise ValueError(arg)
+    return n
+
+
+def describe_effort(budget: int | None) -> str:
+    if budget is None:
+        return "auto (server default)"
+    if budget == 0:
+        return "off (no thinking)"
+    if budget == -2:
+        return "unlimited"
+    name = next((k for k, v in EFFORT_LEVELS.items() if v == budget and k != "med"), "")
+    return f"{budget:,} tokens" + (f" ({name})" if name else "")
+
+
 class Chat:
     def __init__(self, console: Console, url: str, *, model: str = "", label: str = "", system: str = "",
                  params: dict | None = None, show_reasoning: bool = True, markdown: bool = True) -> None:
@@ -321,6 +359,7 @@ class Chat:
         self.system = system
         self.params = dict(params or {})
         self.show_reasoning = show_reasoning
+        self.effort: int | None = None  # thinking budget (see parse_effort); None leaves it to the server
         self.history: list[dict] = []
         self.session = None  # prompt_toolkit input line, set up when the interactive loop starts
 
@@ -366,6 +405,14 @@ class Chat:
                 **self.params}
         if self.model:
             body["model"] = self.model
+        if self.effort == 0:
+            kw = dict(body.get("chat_template_kwargs") or {})
+            kw["enable_thinking"] = False
+            body["chat_template_kwargs"] = kw
+            body["thinking_budget_tokens"] = 0
+        elif self.effort is not None:
+            # llama-server: per-request budget; -1 means "use --reasoning-budget", so unlimited is a huge number
+            body["thinking_budget_tokens"] = self.effort if self.effort > 0 else 2**31 - 1
         out: queue.Queue = queue.Queue()
         holder: dict = {}
         cancel = threading.Event()
@@ -557,13 +604,26 @@ class Chat:
         elif cmd == "/think":
             self.show_reasoning = not self.show_reasoning
             self.console.print(f"[dim]  reasoning {'shown' if self.show_reasoning else 'hidden'}[/]")
+        elif cmd in ("/effort", "/budget"):
+            if arg.strip():
+                try:
+                    self.effort = parse_effort(arg)
+                except ValueError:
+                    self.console.print(f"[warn]  /effort: unknown value {escape(arg.strip())}[/] "
+                                       "[dim]— a token count (e.g. 2048, 8k), low/medium/high/max, off or auto[/]")
+                    return True
+                self.console.print(f"[dim]  thinking budget: {escape(describe_effort(self.effort))}[/]")
+            else:
+                self.console.print(f"[dim]  thinking budget: {escape(describe_effort(self.effort))} · "
+                                   "set with /effort N | low | medium | high | max | off | auto[/]")
         elif cmd in ("/md", "/markdown", "/plain"):
             self.markdown = cmd != "/plain" and not self.markdown
             self.console.print(f"[dim]  replies {'rendered as Markdown' if self.markdown else 'shown as plain text'}[/]")
         elif cmd == "/info":
             turns = sum(1 for m in self.history if m["role"] == "user")
             chars = sum(len(m["content"]) for m in self.messages())
-            self.console.print(f"[dim]  {escape(self.label)} · {self.url} · {turns} message(s) · {chars} chars[/]")
+            self.console.print(f"[dim]  {escape(self.label)} · {self.url} · {turns} message(s) · {chars} chars · "
+                               f"thinking {escape(describe_effort(self.effort))}[/]")
         else:
             self.console.print(f"[warn]  unknown command {escape(cmd)}[/] [dim]— /help[/]")
         return True

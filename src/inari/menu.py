@@ -65,7 +65,7 @@ TIPS = ["inari --help lists every command",
         "the http download backend resumes partial downloads (o → Settings)",
         "o → Settings → Theme previews every theme live",
         "inari demo shows the monitor with a simulated server",
-        "help foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
+        "learn about helping foxes in UK! read more: https://foxproject.org.uk/ (personal recommendation, not affiliated with inari)"]
 TIP_SECONDS = 20.0  # how long one tip stays before the next one
 
 
