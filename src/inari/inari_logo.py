@@ -21,7 +21,7 @@ ART_FALLBACKS = [
 ]
 ASCII_LOGO = ART_FALLBACKS[-1]
 ascii_only = False  # set by `inari --nologo`
-TAGLINE = ["", "llama.cpp, served golden", f"v{__version__}"]
+TAGLINE = ["", "🦊 llama.cpp, served golden", f"v{__version__}, made with ❤ by KiTsuNeKo Works/src3453"]
 
 
 def _mix(a: str, b: str, t: float) -> str:

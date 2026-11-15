@@ -765,7 +765,7 @@ def cmd_config(a: argparse.Namespace) -> None:
 
 # ───────────────────────── parser ─────────────────────────
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="inari", description="Golden TUI wrapper for llama.cpp's llama-server")
+    ap = argparse.ArgumentParser(prog="inari", description="A helpful, swift, golden TUI wrapper for llama.cpp's llama-server")
     ap.add_argument("-V", "--version", action="version", version=f"inari {__version__}")
     ap.add_argument("--nologo", action="store_true", help="show the logo as plain ASCII text")
     sub = ap.add_subparsers(dest="cmd")
