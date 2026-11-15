@@ -308,9 +308,10 @@ def import_command(text: str, *, name: str = "", yes: bool = False, via: str = "
         return None
     tokens, _ = importer.split_statements(text)
     binary = ""
-    if tokens and not tokens[0].startswith("-"):
-        cand = Path(tokens[0]).expanduser()
-        binary = str(cand) if cand.is_file() else (shutil.which(tokens[0]) or "")
+    src_bin, program, _ = importer.program_of(tokens)
+    if src_bin and Path(src_bin).stem.lower().startswith("llama-server"):  # only llama-server itself runs a profile
+        cand = Path(src_bin).expanduser()
+        binary = str(cand) if cand.is_file() else (shutil.which(src_bin) or "")
     with console.status("[accent]Reading llama-server settings…[/]"):
         cat = argspec.load(cfg, binary or None)
     imp = importer.parse(text, cat, cfg)
@@ -319,7 +320,8 @@ def import_command(text: str, *, name: str = "", yes: bool = False, via: str = "
     t = Table.grid(padding=(0, 2))
     t.add_column(style="dim", no_wrap=True)
     t.add_column(style="text", overflow="fold")
-    t.add_row("binary", imp.binary or "—")
+    t.add_row("from", (imp.binary + (f" {imp.program}" if Path(imp.binary).stem.lower() == "llama" else ""))
+              if imp.binary else "—")
     if imp.hf:
         target = imp.hf.repo + (f":{imp.hf.quant}" if imp.hf.quant else "") + (f"  {imp.hf.file}" if imp.hf.file else "")
         t.add_row("model", f"{imp.model or target}" + ("" if imp.model else "  [warn](not downloaded yet)[/]"))

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from inari import hfcache, hub
-from inari.argspec import ArgSpec, Catalog
+from inari.argspec import ArgSpec, Catalog, parse_help
 from inari.config import Config
 
 DEFAULT_QUANT = "Q4_K_M"  # what llama.cpp's -hf picks when no :QUANT is given
@@ -32,6 +32,43 @@ SECRET_KEYS = {"hf-token"}
 PATH_KEYS = {"mmproj", "model-draft", "lora", "lora-scaled", "control-vector", "control-vector-scaled",
              "chat-template-file", "grammar-file", "json-schema-file", "slot-save-path", "model-vocoder",
              "path", "media-path"}
+SERVER_PROGRAMS = ("", "server", "serve")  # llama-server, `llama server`, `llama serve`
+# options that only mean something to llama-cli / the interactive tools — dropped when importing those
+CLI_ONLY = {"prompt", "file", "binary-file", "system-prompt", "system-prompt-file", "conversation",
+            "no-conversation", "single-turn", "interactive", "interactive-first", "multiline-input", "in-prefix",
+            "in-suffix", "in-prefix-bos", "reverse-prompt", "escape", "no-escape", "no-display-prompt", "color",
+            "simple-io", "prompt-cache", "prompt-cache-all", "prompt-cache-ro", "show-timings", "no-show-timings",
+            "image", "audio", "verbose-prompt", "no-warmup-prompt"}
+# always understood, whatever the llama-server build (or the built-in fallback catalog) knows
+_IMPORT_HELP = """----- common params -----
+-m,    --model FNAME                    model path
+-mu,   --model-url MODEL_URL            model download url
+-hf,   -hfr, --hf-repo <user>/<model>[:quant]
+                                        Hugging Face model repository
+-hff,  --hf-file FILE                   Hugging Face model file
+-hft,  --hf-token TOKEN                 Hugging Face access token
+--mmproj-auto, --no-mmproj, --no-mmproj-auto
+                                        whether to use a multimodal projector file
+-mm,   --mmproj FILE                    path to a multimodal projector file
+-mmu,  --mmproj-url URL                 URL to a multimodal projector file
+--host HOST                             ip address to listen
+--port PORT                             port to listen
+--metrics                               enable prometheus compatible metrics endpoint
+-p,    --prompt PROMPT                  prompt to start generation with
+-f,    --file FNAME                     a file containing the prompt
+-sys,  --system-prompt PROMPT           system prompt
+-sysf, --system-prompt-file FNAME       system prompt file
+-cnv,  --conversation, -no-cnv, --no-conversation
+                                        conversation mode
+-st,   --single-turn                    run conversation for a single turn only
+-i,    --interactive                    run in interactive mode
+-if,   --interactive-first              run in interactive mode and wait for input right away
+-mli,  --multiline-input                allows you to write or paste multiple lines
+-r,    --reverse-prompt PROMPT          halt generation at PROMPT
+--color                                 colorise output
+--image, --audio FILE                   path to an image or audio file
+"""
+_BASE = Catalog(parse_help(_IMPORT_HELP), source="built-in")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _PS_ENV_RE = re.compile(r"^\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", re.I)
 _SET_ENV_RE = re.compile(r"^set\s+\"?([A-Za-z_][A-Za-z0-9_]*)=(.*?)\"?$", re.I)
@@ -49,6 +86,7 @@ class HfTarget:
 @dataclass
 class Imported:
     binary: str = ""
+    program: str = ""  # "server", "cli", … — from llama-server / llama-cli / `llama cli`
     model: str = ""  # profile value: hf:// ref, path, or "" when it still has to be fetched
     model_path: Path | None = None
     hf: HfTarget | None = None  # set when the model comes from Hugging Face
@@ -60,6 +98,10 @@ class Imported:
     env: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)  # things the user should know (dropped / kept as-is)
     recognized: list[tuple[str, str]] = field(default_factory=list)  # (as written, profile key=value) for display
+
+    @property
+    def is_server(self) -> bool:
+        return self.program in SERVER_PROGRAMS
 
     @property
     def needs_fetch(self) -> bool:
@@ -132,6 +174,20 @@ def split_statements(text: str) -> tuple[list[str], dict[str, str]]:
 
 
 # ───────────────────────── parsing ─────────────────────────
+def program_of(tokens: list[str]) -> tuple[str, str, int]:
+    """(binary, program, tokens used): ``llama-server`` → server, ``llama-cli.exe`` → cli,
+    ``llama cli`` / ``llama server`` (the unified binary + subcommand) → cli / server."""
+    if not tokens or tokens[0].startswith("-"):
+        return "", "", 0
+    binary = tokens[0]
+    stem = re.sub(r"\.exe$", "", Path(binary.replace("\\", "/")).name.lower())
+    if stem == "llama" and len(tokens) > 1 and re.fullmatch(r"[a-z][a-z0-9-]*", tokens[1]):
+        return binary, tokens[1].lower(), 2
+    if stem.startswith("llama-"):
+        return binary, stem[6:], 1
+    return binary, "", 1
+
+
 def _num(v: str) -> Any:
     if _NUM_RE.match(v):
         return float(v) if "." in v else int(v)
@@ -162,11 +218,11 @@ def _add(args: dict[str, Any], key: str, value: Any) -> None:
 def parse(text: str, cat: Catalog, cfg: Config, *, cwd: Path | None = None) -> Imported:
     tokens, env = split_statements(text)
     imp = Imported(env=env)
-    if tokens and not tokens[0].startswith("-"):
-        imp.binary = tokens.pop(0)
-        name = Path(imp.binary).name.lower()
-        if "llama" in name and "server" not in name:
-            imp.notes.append(f"{Path(imp.binary).name} is not llama-server — flags it doesn't know are kept as-is")
+    imp.binary, imp.program, used = program_of(tokens)
+    tokens = tokens[used:]
+    if not imp.is_server:
+        what = f"llama {imp.program}" if Path(imp.binary).stem.lower() == "llama" else Path(imp.binary).name
+        imp.notes.append(f"converted from {what} — options llama-server doesn't have are dropped")
     cwd = cwd or Path.cwd()
     i = 0
     model_arg = ""
@@ -179,13 +235,23 @@ def parse(text: str, cat: Catalog, cfg: Config, *, cwd: Path | None = None) -> I
             continue
         flag, eq, inline = tok.partition("=")
         spec, negated = cat.lookup(flag)
+        from_base = spec is None
         if spec is None:
-            # unknown to this build: keep verbatim, with its value if one follows
-            imp.extra.append(tok)
-            if not eq and i < len(tokens) and not tokens[i].startswith("-"):
-                imp.extra.append(tokens[i])
-                i += 1
-            imp.notes.append(f"{flag} is not in this llama-server's --help — kept verbatim in extra")
+            spec, negated = _BASE.lookup(flag)
+            if spec is not None and spec.key not in MODEL_KEYS | CLI_ONLY | {"mmproj-auto", "mmproj", "mmproj-url"}:
+                spec = None
+        if spec is None:
+            # unknown to this build: keep verbatim (with its value if one follows) — unless the command
+            # was for another tool, where it would only make llama-server refuse to start
+            val = [] if eq or i >= len(tokens) or not _looks_like_value(tokens[i]) else [tokens[i]]
+            i += len(val)
+            if imp.is_server or cat.source == "built-in":
+                imp.extra += [tok, *val]
+                imp.notes.append(f"{flag} is not in this llama-server's --help — kept verbatim in extra"
+                                 if cat.source != "built-in" else
+                                 f"{flag} kept verbatim in extra (no llama-server set up to check it against)")
+            else:
+                imp.notes.append(f"{' '.join([tok, *val])} dropped — not a llama-server option")
             continue
         takes = "no" if negated else _takes_value(spec)
         value: Any = True
@@ -207,6 +273,9 @@ def parse(text: str, cat: Catalog, cfg: Config, *, cwd: Path | None = None) -> I
             value = _num(value)
 
         key = spec.key
+        if key in CLI_ONLY and (not imp.is_server or cat.get(key) is None):
+            imp.notes.append(f"{flag} dropped — only meaningful for llama-cli")
+            continue
         if key in SECRET_KEYS:
             imp.notes.append(f"{flag} dropped — secrets don't go into profiles (inari config set hf_token …)")
             continue
@@ -232,9 +301,10 @@ def parse(text: str, cat: Catalog, cfg: Config, *, cwd: Path | None = None) -> I
         elif key == "port":
             imp.port = int(value) if isinstance(value, int) else 0
         elif negated:
-            _add(imp.args, spec.neg or key, True)
             if flag.lstrip("-") in ("no-mmproj", "no-mmproj-auto"):
                 imp.want_mmproj = False
+            if not from_base:  # a spelling only our table knows may not exist in this build
+                _add(imp.args, spec.neg or key, True)
         else:
             if key in PATH_KEYS and isinstance(value, str):
                 value = _path_value(cfg, value, cwd)

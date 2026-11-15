@@ -55,6 +55,7 @@ uv run inari import -y -p qwen3-8b "..."   # 確認なしでダウンロード�
 
 - `-m PATH` → そのファイル（HF キャッシュ内なら `hf://` 参照に変換）。見つからなければローカルのモデルからファイル名で探す
 - `-hf owner/repo[:QUANT]`（`-hff` も可）/ `-mu https://huggingface.co/…/resolve/…` → llama.cpp と同じ規則でファイルを選び（QUANT 省略時は Q4_K_M）、HF キャッシュにあればそれを使い、無ければサイズを確認してダウンロード。`-hf` と同様に mmproj も取得（`--no-mmproj` なら取得しない）
+- `llama-server` / `llama server` / `llama serve` だけでなく `llama-cli` / `llama cli` のコマンドも取り込めます（llama-server に無いオプションや `-p`・`-cnv` などの CLI 専用オプションは除外）
 - `--host` / `--port` はプロファイルの listen に、`FOO=1 llama-server …`・`$env:FOO="1"; …`・`set FOO=1 && …` は `[env]` に入る
 - その llama-server のビルドが知らないフラグは `extra` にそのまま残し、`--hf-token` は保存しない（`inari config set hf_token` を使う）。`--metrics` は inari が自動で付けるので省く
 - コマンドの llama-server が設定と違うビルドなら、プロファイルの `server_bin` に記録（未設定なら `llama_server` として登録）
