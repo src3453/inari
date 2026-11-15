@@ -481,7 +481,9 @@ class Wizard:
                         if self.handle(key):
                             return self.exit_reason or "done"
                     now = time.monotonic()
-                    if pressed or now - last >= 0.5:
+                    busy = self.tuner is not None and not self.tuner.done
+                    if pressed or now - last >= (0.2 if busy else 0.5):
+                        self.poll_install()
                         live.update(self.render(), refresh=True)
                         last = now
                     time.sleep(0.03)
@@ -716,7 +718,34 @@ class Wizard:
             return True
         return False
 
+    def use_binary(self) -> None:
+        """Re-read everything that depends on the llama-server build."""
+        self.binary = self.cfg.server_binary()
+        self.cat = argspec.load(self.cfg, self.binary)
+        self.hw = tuning.detect(self.binary)
+        self.set_model(self.model, self.model_path, self.model_size, keep_mmproj=True)
+
+    def poll_install(self) -> None:
+        """Pick up a llama.cpp build that ``i`` (or the menu's background install) just finished."""
+        if self.binary or not self.cfg.server_binary():
+            return
+        self.use_binary()
+        self.say(f"✔ llama.cpp installed — {len(self.cat.visible)} settings read from {Path(self.binary or '').name}")
+
     def key_server(self, key: str) -> bool:
+        if key == "i":
+            from inari import updater
+
+            bg = updater.background(self.cfg, create=True)
+            assert bg
+            if bg.busy:
+                self.say(bg.status())
+            elif self.binary and not (bg.info and bg.info.available):
+                bg.start_check(self.cfg, force=True)  # shows "up to date" or offers the update
+            else:
+                bg.start_check(self.cfg, force=True, install_after=True)
+                self.say("looking for the newest llama.cpp release …")
+            return False
         if key == "enter" or key == "e":
             def submit(raw: str) -> str | None:
                 raw = raw.strip().strip('"')
@@ -731,9 +760,7 @@ class Wizard:
                 self.cfg.save()
                 self.binary = self.cfg.server_binary()
                 self.say("reading llama-server --help …")
-                self.cat = argspec.load(self.cfg, self.binary)
-                self.hw = tuning.detect(self.binary)
-                self.set_model(self.model, self.model_path, self.model_size, keep_mmproj=True)
+                self.use_binary()
                 self.say(f"✔ {len(self.cat.visible)} settings read from {Path(self.binary or raw).name}")
                 return None
 
@@ -996,9 +1023,14 @@ class Wizard:
             t.add_row("settings", f"{len(self.cat.visible)} flags read from --help")
         else:
             t.add_row("binary", Text("not found", style=f"bold {p.bad}"))
-            t.add_row("", Text("Point inari at llama-server(.exe) or the folder that contains it (Enter).\n"
-                               "Builds: https://github.com/ggml-org/llama.cpp/releases", style=p.text))
+            t.add_row("", Text("Press i to download the official llama.cpp build for this PC, or point inari at\n"
+                               "your own llama-server(.exe) or the folder that contains it (Enter).", style=p.text))
             t.add_row("settings", f"{len(self.cat.visible)} common flags (built-in list until a binary is set)")
+        from inari import updater
+
+        bg = updater.background(self.cfg)
+        if bg and (bg.busy or bg.message):
+            t.add_row("llama.cpp", Text(bg.status(), style=p.warn if bg.error else p.accent2))
         t.add_row("devices", self.hw.describe())
         for d in self.hw.devices:
             t.add_row("", Text(f"{d.id}: {d.name}  {tuning.gb(d.total)} total · {tuning.gb(d.free)} free",
@@ -1267,7 +1299,8 @@ class Wizard:
             if step == "advanced":
                 items.append(("empty", "= reset"))
         elif step == "server":
-            items = [("Enter", "set path"), ("n", "next"), ("c", "copy command"), ("q", "quit")]
+            items = [("Enter", "set path"), ("i", "install llama.cpp" if not self.binary else "update llama.cpp"),
+                     ("n", "next"), ("c", "copy command"), ("q", "quit")]
         elif step == "model":
             items = [("↑↓", "choose"), ("Enter", "use"), ("h", "download from Hub"), ("p", "path"),
                      ("m", "mmproj"), ("d", "delete from disk"), ("n", "next"), ("Esc", "back"), ("q", "quit")]

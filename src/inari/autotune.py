@@ -19,6 +19,7 @@ Search (coordinate descent, cheapest first):
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -71,6 +72,18 @@ class Trial:
     error: str = ""
     score: float = 0.0
     note: str = ""  # stage, e.g. "placement"
+
+
+@dataclass
+class Progress:
+    """Token counts of the measurement request in flight (written by the tuner thread)."""
+    pp_total: int
+    tg_total: int
+    rep: int = 1
+    reps: int = 1
+    pp_done: int = 0
+    tg_done: int = 0
+    pp_known: bool = False  # False until the server reports prompt progress (or the first token)
 
 
 def describe(knobs: dict[str, Any]) -> str:
@@ -131,6 +144,7 @@ class Tuner:
         self._cancel = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._tokens: list[int] | None = None
+        self.progress: Progress | None = None  # set while a measurement request is running
         self._thread: threading.Thread | None = None
 
         gpu = bool(hw.devices)
@@ -327,15 +341,59 @@ class Tuner:
             self._check()
             self.status = (f"measuring {self.n_prompt} prompt + {self.n_gen} generated tokens"
                            + (f" ({i + 1}/{self.repeats})" if self.repeats > 1 else "") + f" — {t.label}")
-            r = c.post(url + "/completion", json={
-                "prompt": prompt, "n_predict": self.n_gen, "cache_prompt": False, "ignore_eos": True,
-                "temperature": 0.0, "stream": False,
-            })
-            if r.status_code != 200:
-                raise _Failed(f"HTTP {r.status_code}: {r.text[:120]}")
-            tm = r.json()["timings"]
+            self.progress = Progress(self.n_prompt, self.n_gen, i + 1, self.repeats)
+            try:
+                tm = self._stream(c, url, prompt)
+            finally:
+                self.progress = None
             t.pp = max(t.pp, float(tm.get("prompt_per_second") or 0))
             t.tg = max(t.tg, float(tm.get("predicted_per_second") or 0))
+
+    def _stream(self, c: httpx.Client, url: str, prompt: list[int]) -> dict[str, Any]:
+        """Run one measured completion as a stream, updating ``self.progress``; returns its timings.
+
+        ``return_progress`` makes newer llama-server builds report prompt processing in chunks
+        (older ones ignore it — the prompt bar then just jumps to full at the first token).
+        """
+        body = {"prompt": prompt, "n_predict": self.n_gen, "cache_prompt": False, "ignore_eos": True,
+                "temperature": 0.0, "stream": True, "return_progress": True, "timings_per_token": True}
+        timings: dict[str, Any] = {}
+        with c.stream("POST", url + "/completion", json=body) as r:
+            if r.status_code != 200:
+                raise _Failed(f"HTTP {r.status_code}: {r.read().decode(errors='replace')[:120]}")
+            for line in r.iter_lines():
+                self._check()
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                msg = json.loads(data)
+                pr = self.progress
+                if pr is None:
+                    continue
+                pp = msg.get("prompt_progress")
+                if isinstance(pp, dict):
+                    total = int(pp.get("total") or 0) - int(pp.get("cache") or 0)
+                    done = int(pp.get("processed") or 0) - int(pp.get("cache") or 0)
+                    pr.pp_total = total if total > 0 else pr.pp_total
+                    pr.pp_done = max(pr.pp_done, min(done, pr.pp_total))
+                    pr.pp_known = True
+                if msg.get("timings"):
+                    timings = msg["timings"]
+                if msg.get("stop"):
+                    pr.pp_done = pr.pp_total
+                    n = int(timings.get("predicted_n") or 0)
+                    pr.tg_done = n if n else pr.tg_done
+                    continue
+                if not isinstance(pp, dict) or msg.get("content"):
+                    pr.pp_done, pr.pp_known = pr.pp_total, True  # first token ⇒ prompt is fully read
+                    n = int((msg.get("timings") or {}).get("predicted_n") or 0)
+                    pr.tg_done = min(pr.tg_total, n if n else pr.tg_done + 1)
+        if not timings:
+            raise _Failed("server sent no timings")
+        return timings
 
     def _reason(self, offset: int) -> str:
         try:
@@ -553,6 +611,7 @@ def render(tuner: Tuner, p: Any, rows: int = 12):
             nums = ("—", "—", "—", "")
         t.add_row(str(i), Text(tr.label, style=st), *[Text(n, style=st) for n in nums], status)
     foot = Text()
+    bars = _progress(tuner.progress, p) if not tuner.done else None
     if not tuner.done:
         foot.append("▸ " + tuner.status, style=p.accent2)
     elif tuner.error:
@@ -568,4 +627,30 @@ def render(tuner: Tuner, p: Any, rows: int = 12):
             foot.append(f"   {g:+.0%} vs current", style=p.good if g > 0.005 else p.dim)
         if tuner.cancelled:
             foot.append("   (cancelled early)", style=p.warn)
+    if bars is not None:
+        return Group(head, Text(""), t, Text(""), bars, foot)
     return Group(head, Text(""), t, Text(""), foot)
+
+
+def _progress(pr: Progress | None, p: Any):
+    """Two bars for the request in flight: prompt tokens read, then tokens generated."""
+    if pr is None:
+        return None
+    from rich.progress_bar import ProgressBar
+    from rich.table import Table
+    from rich.text import Text
+
+    g = Table.grid(padding=(0, 1), expand=True)
+    g.add_column(no_wrap=True, width=7)
+    g.add_column(ratio=1)
+    g.add_column(no_wrap=True, justify="right", min_width=13)
+    g.add_column(no_wrap=True, min_width=5)
+    rep = f"{pr.rep}/{pr.reps}" if pr.reps > 1 else ""
+    pp_bar = ProgressBar(total=pr.pp_total if pr.pp_known else None, completed=pr.pp_done,
+                         complete_style=p.accent, finished_style=p.good, pulse_style=p.accent)
+    g.add_row(Text("prompt", style=p.dim), pp_bar,
+              Text(f"{pr.pp_done:,}/{pr.pp_total:,}" if pr.pp_known else f"…/{pr.pp_total:,}", style=p.text),
+              Text(rep, style=p.dim))
+    tg_bar = ProgressBar(total=pr.tg_total, completed=pr.tg_done, complete_style=p.accent2, finished_style=p.good)
+    g.add_row(Text("gen", style=p.dim), tg_bar, Text(f"{pr.tg_done:,}/{pr.tg_total:,}", style=p.text), Text(""))
+    return g

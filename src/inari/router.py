@@ -123,7 +123,7 @@ def build_presets(cfg: Config, load: list[str] | None = None) -> Presets:
 def build_command(cfg: Config, *, host: str, port: int, models_max: int | None = None) -> list[str]:
     binary = cfg.server_binary()
     if not binary:
-        raise FileNotFoundError("llama-server not found. Put it on PATH or run: "
+        raise FileNotFoundError("llama-server not found. Install the official build with: inari update, or run: "
                                 "inari config set llama_server <path-to-llama-server>")
     cmd = [binary, "--models-preset", str(preset_path()), "--host", host, "--port", str(port),
            "--metrics", "-lv", "4"]  # inherited by every model instance

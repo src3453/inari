@@ -25,9 +25,12 @@ class ConfirmModal:
         self.ok_label = "Delete"
         self.on_yes: Callable[[], None] | None = None
         self.focus_ok = False
+        self.danger = True
 
-    def open(self, title: str, lines: list[Text | str], on_yes: Callable[[], None], *, ok_label: str = "Delete") -> None:
+    def open(self, title: str, lines: list[Text | str], on_yes: Callable[[], None], *, ok_label: str = "Delete",
+             danger: bool = True) -> None:
         self.active = True
+        self.danger = danger
         self.title = title
         self.lines = [ln if isinstance(ln, Text) else Text(ln) for ln in lines]
         self.ok_label = ok_label
@@ -61,14 +64,15 @@ class ConfirmModal:
             return Text(f"[ {label} ]", style=p.bad if danger else p.dim)
 
         buttons = Text.assemble(button("Cancel", not self.focus_ok, False), "    ",
-                                button(self.ok_label, self.focus_ok, True))
+                                button(self.ok_label, self.focus_ok, self.danger))
         hint = Text.assemble(("←→", f"bold {p.accent}"), (" choose   ", p.dim), ("Enter", f"bold {p.accent}"),
                              (" press   ", p.dim), ("y", f"bold {p.accent}"), (f" {self.ok_label.lower()}   ", p.dim),
                              ("Esc", f"bold {p.accent}"), (" cancel", p.dim))
         body = Group(*[ln.copy() for ln in self.lines], Text(""), Align.center(buttons), Text(""),
                      Align.center(hint))
-        panel = Panel(body, title=Text(f" {self.title} ", style=f"bold {p.bad}"), title_align="left",
-                      border_style=p.bad, box=box.ROUNDED, padding=(1, 3), width=72)
+        edge = p.bad if self.danger else p.accent
+        panel = Panel(body, title=Text(f" {self.title} ", style=f"bold {edge}"), title_align="left",
+                      border_style=edge, box=box.ROUNDED, padding=(1, 3), width=72)
         return Align.center(panel, vertical="middle")
 
 

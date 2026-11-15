@@ -149,7 +149,7 @@ class Profile:
         binary = binary or cfg.server_binary(self.server_bin)
         if not binary:
             raise FileNotFoundError(
-                "llama-server not found. Put it on PATH or run: "
+                "llama-server not found. Install the official build with: inari update, or run: "
                 "inari config set llama_server <path-to-llama-server>"
             )
         cmd = [binary]
