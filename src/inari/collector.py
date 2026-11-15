@@ -91,7 +91,7 @@ def _next_token(slot: dict) -> dict:
 
 
 class Collector:
-    interval = 0.5
+    interval = 1.0
 
     def __init__(self, url: str, *, log_path: str | None = None, pid: int | None = None,
                  name: str = "", cmd: list[str] | None = None, started: float | None = None,

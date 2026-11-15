@@ -1,4 +1,5 @@
-"""``inari setup``: a full-screen wizard that builds a launch profile step by step.
+"""``inari setup`` ("Setup & models"): a full-screen wizard that builds a launch profile step by step.
+Its model step doubles as the local model manager (pick, download from the Hub, delete from disk).
 
 Steps: llama-server → model → name → context & memory → GPU → chat → network →
 advanced (every llama-server flag, with Default / Tuned / Yours columns) → review.
@@ -896,7 +897,7 @@ class Wizard:
                 on = bool(self.mine.get("mmproj"))
                 info.add_row("vision", Text(f"[{'x' if on else ' '}] {proj.name}  (m toggles)",
                                             style=p.accent2 if on else p.dim))
-        return Group(self.title("Pick a model", f"{len(self.models)} on disk"), t, Text(""), info)
+        return Group(self.title("Models", f"{len(self.models)} on disk · Enter uses one for this profile · d deletes it from disk"), t, Text(""), info)
 
     def view_form(self, h: int) -> RenderableType:
         p = self.p
@@ -1112,7 +1113,7 @@ class Wizard:
             items = [("Enter", "set path"), ("n", "next"), ("c", "copy command"), ("q", "quit")]
         elif step == "model":
             items = [("↑↓", "choose"), ("Enter", "use"), ("h", "download from Hub"), ("p", "path"),
-                     ("m", "mmproj"), ("d", "delete"), ("n", "next"), ("Esc", "back")]
+                     ("m", "mmproj"), ("d", "delete from disk"), ("n", "next"), ("Esc", "back"), ("q", "quit")]
         elif step == "advanced":
             items = [("n", "next"), ("↑↓", "choose"), ("Enter", "edit"), ("←→", "cycle"), ("Esc", "back"),
                      ("Del", "reset"), ("x", "experimental"), ("/", "filter"), ("a", "add by name"),

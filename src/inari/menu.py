@@ -34,7 +34,7 @@ class Row:
 
 
 ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded on demand"),
-           ("new", "+ New profile", "guided setup wizard"),
+           ("new", "+ Setup & models", "new profile wizard · pick, download or delete local models"),
            ("import", "⇲ Import command", "paste a llama-server command line → profile"),
            ("hub", "↓ Hub", "search Hugging Face and download GGUFs"),
            ("demo", "▷ Demo", "try the monitor with a simulated server"),
@@ -262,11 +262,11 @@ class Menu:
         if profs:
             head.append(f"   {len(profs)}" + (f"  ·  showing {a + 1}–{b}" if b - a < len(profs) else ""), style=p.dim)
         else:
-            head.append("   none yet — choose + New profile to run setup", style=p.accent2)
+            head.append("   none yet — choose + Setup & models to make one", style=p.accent2)
 
         at = Table.grid(padding=(0, 2))
         at.add_column(width=2, no_wrap=True)
-        at.add_column(width=name_w, no_wrap=True)
+        at.add_column(width=max(name_w, max(len(lb) for _, lb, _ in ACTIONS)), no_wrap=True)
         at.add_column(no_wrap=True, overflow="ellipsis")
         for i, r in acts:
             on = i == self.sel
@@ -287,7 +287,7 @@ class Menu:
         if msg and time.monotonic() < until:
             return Text(" " + msg, style=p.accent2)
         if not self.has_bin:
-            return Text(" llama-server not found — + New profile walks you through setting it up", style=p.warn)
+            return Text(" llama-server not found — + Setup & models walks you through setting it up", style=p.warn)
         return Text(" inari --help lists every command", style=p.dim)
 
     def hints(self) -> RenderableType:
@@ -301,7 +301,7 @@ class Menu:
                 items.append(("x", "stop"))
             else:
                 items.append(("d", "delete"))
-        items += [("r", "router"), ("n", "new profile"), ("i", "import"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
+        items += [("r", "router"), ("n", "setup & models"), ("i", "import"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
         t = Text()
         for key, label in items:
             t.append(key, style=f"bold {p.accent}")

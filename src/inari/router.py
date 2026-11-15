@@ -2,8 +2,8 @@
 
 One llama-server listens on one port and starts / stops a child llama-server per model on demand
 (``"model": "<name>"`` in a request, or POST /models/load). Every inari profile becomes a model preset
-named after the profile, written to ``~/.inari/router/presets.ini``; models in the HF cache are listed
-by llama-server itself.
+named after the profile, written to ``~/.inari/router/presets.ini``. Models in the HF cache that no
+profile covers are hidden unless ``--allow-no-profile-models`` is given (then llama-server lists them itself).
 """
 
 from __future__ import annotations
@@ -137,14 +137,28 @@ def url_for(host: str, port: int) -> str:
     return f"http://{h}:{port}"
 
 
+def hide_cache_env() -> dict[str, str]:
+    """Env that points llama-server's HF cache lookup at an empty dir, so the router lists only presets.
+
+    Presets reference model files by absolute path, so they keep working; only the cache scan comes up empty.
+    """
+    empty = router_dir() / "empty-cache"
+    empty.mkdir(parents=True, exist_ok=True)
+    return {"LLAMA_CACHE": str(empty), "HF_HUB_CACHE": str(empty), "HUGGINGFACE_HUB_CACHE": str(empty)}
+
+
 def launch(cfg: Config, *, host: str = "127.0.0.1", port: int = 8080, models_max: int | None = None,
-           load: list[str] | None = None) -> tuple[server.RunInfo, subprocess.Popen, Presets]:
+           load: list[str] | None = None,
+           allow_no_profile_models: bool = False) -> tuple[server.RunInfo, subprocess.Popen, Presets]:
     pre = build_presets(cfg, load)
     cmd = build_command(cfg, host=host, port=port, models_max=models_max)
     if server.port_in_use(host, port):
         raise RuntimeError(f"port {port} is already in use")
     preset_path().write_text(pre.text, encoding="utf-8")
-    run, proc = server.spawn(NAME, cmd, url_for(host, port), cfg, env=pre.env, log_name="router")
+    env = dict(pre.env)
+    if not allow_no_profile_models:
+        env.update(hide_cache_env())
+    run, proc = server.spawn(NAME, cmd, url_for(host, port), cfg, env=env, log_name="router")
     return run, proc, pre
 
 

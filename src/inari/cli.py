@@ -512,13 +512,15 @@ def cmd_serve_router(a: argparse.Namespace) -> None:
     port = getattr(a, "port", None) or 8080
     try:
         run, proc, pre = router.launch(cfg, host=host, port=port, models_max=getattr(a, "models_max", None),
-                                       load=getattr(a, "load", None) or [])
+                                       load=getattr(a, "load", None) or [],
+                                       allow_no_profile_models=getattr(a, "allow_no_profile_models", False))
     except (FileNotFoundError, RuntimeError) as e:
         die(str(e))
         return
     for w in pre.warnings:
         console.print(f"[warn]·[/] [dim]{w}[/]")
-    names = ", ".join(pre.names) if pre.names else "none — only models in the HF cache"
+    allow = getattr(a, "allow_no_profile_models", False)
+    names = ", ".join(pre.names) if pre.names else ("none — only models in the HF cache" if allow else "none")
     console.print(f"[accent]▶[/] started [accent]router[/] pid {run.pid} → [accent2]{run.url}[/]  "
                   f"[dim]profiles: {names}[/]")
     console.print(f"  [dim]pick a model per request with \"model\": \"<profile>\" · log: {run.log}[/]", soft_wrap=True)
@@ -618,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd")
 
     s = sub.add_parser("setup", aliases=["onboard", "wizard"],
-                       help="guided setup: llama-server → model → context / GPU / chat → all args → profile")
+                       help="setup & models wizard: llama-server → model (pick / download / delete) → context / GPU / chat → all args → profile")
     s.add_argument("profile", nargs="?", help="profile to edit (or the name for a new one)")
     s.add_argument("-a", "--advanced", action="store_true", help="open the all-settings table directly")
     s.set_defaults(fn=cmd_setup)
@@ -685,6 +687,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-l", "--load", action="append", metavar="PROFILE", help="router: load this model at startup")
     s.add_argument("--models-max", type=int, metavar="N",
                    help="router: max models loaded at once (llama.cpp default 4, 0 = unlimited)")
+    s.add_argument("--allow-no-profile-models", action="store_true",
+                   help="router: also list models in the HF cache that have no profile")
     s.add_argument("--no-tui", action="store_true", help="start in background and return")
     s.set_defaults(fn=cmd_serve)
 
@@ -811,7 +815,7 @@ def print_help() -> None:
     console.print(banner(th.get(cfg.theme), console))
     console.print()
     for c, d in (("", "main menu: pick a profile to serve, or set one up"),
-                 ("setup [PROFILE]", "guided setup wizard (start here)"),
+                 ("setup [PROFILE]", "setup & models wizard: new profile, manage local models (start here)"),
                  ("import [COMMAND]", "llama-server command → profile (+ model download)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
                  ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
                  ("profile new|set|show|ls", "save llama-server arguments"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
