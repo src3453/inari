@@ -21,6 +21,8 @@ from inari.keys import KeyReader
 from inari.logparse import Request, line_level
 
 VIEWS = ["Overview", "Serving", "Requests", "Engine", "Hardware", "Logs", "Connect"]
+ROUTER_VIEWS = VIEWS + ["Models"]  # router mode adds a model list (load / unload / focus)
+MODEL_STATUS_ORDER = {"loaded": 0, "loading": 1, "sleeping": 2, "unloaded": 3}
 PARTIAL = " ▏▎▍▌▋▊▉"
 SPARK = " ▁▂▃▄▅▆▇█"
 GB = 1024 ** 3
@@ -105,6 +107,12 @@ class App:
         self.snap = collector.snapshot()
         self.result: str = "quit"
         self.flash: tuple[str, float] | None = None
+        self.router = bool(getattr(collector, "parsers", None) is not None)
+        self.views = ROUTER_VIEWS if self.router else VIEWS
+        self.msel = 0  # selected row in the Models view
+        self.msel_id = ""  # ...tracked by id, since the list re-sorts as models load / unload
+        if self.router:
+            self.view = self.views.index("Models")  # nothing is loaded yet: start where you pick one
 
     # ── loop ──
     def run(self) -> str:
@@ -153,12 +161,14 @@ class App:
                 return False
             self.result = "quit"
             return True
-        if key in "1234567" and len(key) == 1:
+        if len(key) == 1 and key.isdigit() and 1 <= int(key) <= len(self.views):
             self.view, self.scroll, self.help = int(key) - 1, 0, False
         elif key in ("right", "tab"):
-            self.view, self.scroll = (self.view + 1) % len(VIEWS), 0
+            self.view, self.scroll = (self.view + 1) % len(self.views), 0
         elif key == "left":
-            self.view, self.scroll = (self.view - 1) % len(VIEWS), 0
+            self.view, self.scroll = (self.view - 1) % len(self.views), 0
+        elif self.router and self.handle_router(key):
+            pass
         elif key == "/":
             self.filter_mode = True
         elif key == "esc":
@@ -189,6 +199,95 @@ class App:
             self.scroll = 0
         return False
 
+    # ── router ──
+    def sorted_models(self) -> list[dict]:
+        models = sorted(self.snap.models, key=lambda m: (MODEL_STATUS_ORDER.get(m["status"], 9),
+                                                         m["source"] != "preset", m["id"].lower()))
+        ids = [m["id"] for m in models]
+        if self.msel_id in ids:
+            self.msel = ids.index(self.msel_id)
+        return models
+
+    def handle_router(self, key: str) -> bool:
+        """Router-only keys. True if handled."""
+        import threading
+
+        from inari import router
+
+        models = self.sorted_models()
+        in_models = self.views[self.view] == "Models"
+        if key == "m":
+            loaded = [m["id"] for m in models if m["status"] in ("loaded", "loading")]
+            if not loaded:
+                self.say("no model loaded — 8 Models, Enter to load one")
+                return True
+            nxt = loaded[(loaded.index(self.snap.focus) + 1) % len(loaded)] if self.snap.focus in loaded else loaded[0]
+            self.c.set_focus(nxt)  # type: ignore[attr-defined]
+            self.say(f"showing {nxt}")
+            return True
+        if key == "f":
+            self.c.follow_auto()  # type: ignore[attr-defined]
+            self.say("following the busy / most recently loaded model")
+            return True
+        if not in_models or not models:
+            return False
+        self.msel = max(0, min(self.msel, len(models) - 1))
+        if key in ("up", "k", "down", "j"):
+            d = -1 if key in ("up", "k") else 1
+            self.msel = max(0, min(len(models) - 1, self.msel + d))
+            self.msel_id = models[self.msel]["id"]
+            return True
+        m = models[self.msel]
+
+        def bg(fn, name: str, ok: str) -> None:
+            def run() -> None:
+                err = fn(self.c.url, name)
+                self.say(f"{name}: {err}" if err else ok)
+                self.c.poke()
+
+            threading.Thread(target=run, daemon=True).start()
+
+        if key == "enter":
+            if m["status"] not in ("loaded", "loading"):
+                bg(router.load_model, m["id"], f"loading {m['id']}…")
+            self.c.set_focus(m["id"])  # type: ignore[attr-defined]
+            self.view = 0
+            return True
+        if key in ("u", "delete"):
+            if m["status"] not in ("loaded", "loading", "sleeping"):
+                self.say(f"{m['id']} is not loaded")
+            else:
+                bg(router.unload_model, m["id"], f"unloaded {m['id']}")
+            return True
+        return False
+
+    def view_models(self, height: int) -> RenderableType:
+        p, s = self.p, self.snap
+        models = self.sorted_models()
+        t = Table(box=box.SIMPLE_HEAD, border_style=p.dim, header_style=f"bold {p.accent}", expand=True)
+        t.add_column("", width=1, no_wrap=True)
+        t.add_column("MODEL", style=p.text, no_wrap=True, overflow="ellipsis", ratio=3)
+        t.add_column("STATUS", no_wrap=True)
+        t.add_column("FROM", style=p.dim, no_wrap=True)
+        t.add_column("", style=p.dim, no_wrap=True)
+        col = {"loaded": p.good, "loading": p.accent2, "sleeping": p.info, "unloaded": p.dim}
+        self.msel = max(0, min(self.msel, len(models) - 1))
+        start = max(0, min(self.msel - (height - 6) // 2, len(models) - (height - 6)))
+        for i, m in enumerate(models[start:start + max(height - 6, 1)], start):
+            on = i == self.msel
+            st = m["status"] or "?"
+            t.add_row(Text("▶" if on else "", style=f"bold {p.accent}"),
+                      Text(m["id"], style=f"bold {p.accent}" if on else p.text),
+                      Text(("● " if st == "loaded" else "") + st, style=col.get(st, p.text)),
+                      "profile" if m["source"] == "preset" else (m["source"] or ""),
+                      Text("monitoring" + (" (auto)" if s.follow else ""), style=p.accent2) if m["id"] == s.focus else "")
+        if not models:
+            t.add_row("", Text("router starting…" if s.health != "ok" else "no models — create a profile "
+                               "(inari setup) or download one (inari hub)", style=p.dim), "", "", "")
+        head = Text("Models", style=f"bold {p.accent}")
+        head.append("   Enter loads a model and opens its monitor · requests load models by name too", style=p.dim)
+        return Group(head, t)
+
     # ── frame ──
     def render(self) -> RenderableType:
         w, h = self.console.size
@@ -208,7 +307,7 @@ class App:
         if self.help:
             return self.view_help()
         return [self.view_overview, self.view_serving, self.view_requests, self.view_engine,
-                self.view_hardware, self.view_logs, self.view_connect][self.view](height)
+                self.view_hardware, self.view_logs, self.view_connect, self.view_models][self.view](height)
 
     # ── chrome ──
     def state_color(self, state: str) -> str:
@@ -223,10 +322,15 @@ class App:
         g.add_column(justify="right", no_wrap=True)
         left = Text()
         left.append("INARI", style=f"bold {p.accent}")
-        left.append("  " + VIEWS[self.view], style=f"bold {p.accent2}")
+        left.append("  " + self.views[self.view], style=f"bold {p.accent2}")
         left.append("    " + s.url, style=f"bold {p.text}")
+        if s.router:
+            n_loaded = sum(1 for m in s.models if m["status"] == "loaded")
+            left.append(f"   router · {n_loaded}/{len(s.models)} loaded", style=p.accent2)
         if s.model:
             left.append("   " + s.model, style=f"bold {p.text}")
+            if s.router and s.follow:
+                left.append(" (auto)", style=p.dim)
         if s.n_ctx:
             left.append(f" {k(s.n_ctx)}", style=p.accent2)
         right = Text()
@@ -240,7 +344,7 @@ class App:
         g.add_row(left, right)
 
         tabs = Text()
-        for i, v in enumerate(VIEWS):
+        for i, v in enumerate(self.views):
             if i == self.view:
                 tabs.append(f"[{i + 1} {v}]", style=f"bold {p.accent}")
             else:
@@ -259,8 +363,15 @@ class App:
                                  (" stop   ", p.text), ("n", f"bold {p.accent}"), (" keep serving in background   ", p.text),
                                  ("any other key", f"bold {p.accent}"), (" cancel", p.text))
         t = Text()
-        for key, label in (("1-7", "views"), ("/", "filter"), ("Space", "freeze"), ("r", "refresh"),
-                           ("t", "theme"), ("b", "open in browser"), ("?", "help"), ("q", "quit")):
+        if self.router and self.views[self.view] == "Models":
+            items = [("↑↓", "choose"), ("Enter", "load + monitor"), ("u", "unload"), ("f", "auto-follow"),
+                     ("1-8", "views"), ("b", "open in browser"), ("q", "quit")]
+        else:
+            items = [("1-8" if self.router else "1-7", "views"), ("/", "filter"), ("Space", "freeze"),
+                     ("r", "refresh"), ("t", "theme"), ("b", "open in browser"), ("?", "help"), ("q", "quit")]
+            if self.router:
+                items.insert(1, ("m", "next model"))
+        for key, label in items:
             t.append(key, style=f"bold {p.accent}")
             t.append(f" {label}    ", style=p.dim)
         if self.filter:
@@ -283,6 +394,8 @@ class App:
             t.append("Read only", style=f"bold {p.accent}")
             t.append("   |   q quit", style=p.text)
         t.append("   |   7 connect an app", style=p.text)
+        if s.router:
+            t.append("   |   8 models", style=p.text)
         if s.info.errors:
             t.append(f"   |   {s.info.errors} errors in log", style=p.bad)
         return t
@@ -317,24 +430,28 @@ class App:
     def requests_table(self, reqs: Iterable[Request], limit: int, wide: bool = False) -> Table:
         p = self.p
         t = Table(box=None, show_edge=False, pad_edge=False, header_style=f"{p.text}", expand=True, padding=(0, 1))
-        cols = [("TIME", "left"), ("STATUS", "left"), ("PROMPT", "right"), ("REUSED", "right")]
+        rows = list(reqs)
+        show_model = any(r.model for r in rows)
+        cols = [("TIME", "left"), ("STATUS", "left")] + ([("MODEL", "left")] if show_model else []) + \
+               [("PROMPT", "right"), ("REUSED", "right")]
         if wide:
             cols = [("TASK", "right")] + cols + [("PP TOK/S", "right")]
         cols += [("OUTPUT", "right"), ("TOK/S", "right"), ("DURATION", "right")]
         for name, j in cols:
-            t.add_column(name, justify=j, no_wrap=True)
-        rows = list(reqs)
+            t.add_column(name, justify=j, no_wrap=True, overflow="ellipsis", max_width=24 if name == "MODEL" else None)
         if self.filter:
             f = self.filter.lower()
-            rows = [r for r in rows if f in r.status.lower() or f in str(r.task)]
+            rows = [r for r in rows if f in r.status.lower() or f in str(r.task) or f in r.model.lower()]
         rows = rows[::-1]
         if wide:
             rows = rows[min(self.scroll, max(len(rows) - 1, 0)):]
         status_col = {"Done": p.good, "Generating": p.accent, "Reading": p.info, "Cancelled": p.warn}
         for r in rows[:limit]:
             tm = datetime.fromtimestamp(r.started).strftime("%H:%M:%S") if r.started else "  —"
-            cells = [Text(tm, style=p.text), Text(r.status, style=status_col.get(r.status, p.text)),
-                     Text(f"{r.prompt:,}", style=p.text), Text(f"{r.reused:,}", style=p.text)]
+            cells = [Text(tm, style=p.text), Text(r.status, style=status_col.get(r.status, p.text))]
+            if show_model:
+                cells.append(Text(r.model, style=f"bold {p.accent2}" if r.model == self.snap.focus else p.dim))
+            cells += [Text(f"{r.prompt:,}", style=p.text), Text(f"{r.reused:,}", style=p.text)]
             if wide:
                 cells = [Text(str(r.task), style=p.dim)] + cells + [
                     Text(f"{r.pp_tps:,.1f}" if r.pp_tps else "--", style=p.text)]
@@ -624,19 +741,25 @@ class App:
     def view_connect(self, height: int) -> RenderableType:
         p, s = self.p, self.snap
         base = s.url
-        model = s.model or "local"
+        model = s.model or ("<model>" if s.router else "local")
+        body = (f'{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}]}}' if s.router
+                else '{"messages":[{"role":"user","content":"hello"}]}')
         blocks = [
             ("OpenAI-compatible endpoint", f"{base}/v1\napi key: anything (e.g. sk-no-key)  ·  model: {model}"),
             ("Web UI", f"{base}/   (press b to open)"),
             ("Environment", f'OPENAI_BASE_URL={base}/v1\nOPENAI_API_KEY=sk-no-key'),
             ("curl", f'curl {base}/v1/chat/completions -H "Content-Type: application/json" \\\n'
-                     f'  -d \'{{"messages":[{{"role":"user","content":"hello"}}]}}\''),
+                     f"  -d '{body}'"),
             ("Python (openai)", f'from openai import OpenAI\nclient = OpenAI(base_url="{base}/v1", api_key="sk-no-key")\n'
                                 f'r = client.chat.completions.create(model="{model}", messages=[{{"role": "user", "content": "hello"}}])\n'
                                 'print(r.choices[0].message.content)'),
         ]
-        panels = [Panel(Text(body, style=p.accent2), title=Text(f" {title} ", style=p.text), title_align="left",
-                        border_style=p.dim, box=box.ROUNDED) for title, body in blocks]
+        if s.router:
+            names = ", ".join(m["id"] for m in s.models) or "—"
+            blocks.insert(1, ("Router", "pick the model per request with \"model\" — it loads on first use\n"
+                                        f"models: {names}"))
+        panels = [Panel(Text(txt, style=p.accent2), title=Text(f" {title} ", style=p.text), title_align="left",
+                        border_style=p.dim, box=box.ROUNDED) for title, txt in blocks]
         return Group(*panels)
 
     def view_help(self) -> RenderableType:
@@ -644,11 +767,15 @@ class App:
         t = Table.grid(padding=(0, 3))
         t.add_column(style=f"bold {p.accent}", no_wrap=True)
         t.add_column(style=p.text)
-        for a, b in (("1 … 7  ← →  Tab", "switch view"), ("/", "filter (logs: text, requests: status/task id)"),
+        rows = [("1 … 8  ← →  Tab" if self.router else "1 … 7  ← →  Tab", "switch view"), ("/", "filter (logs: text, requests: status/task id)"),
                      ("Esc", "clear filter / close help"), ("Space", "freeze / unfreeze the display"),
                      ("r", "refresh now"), ("t", "cycle theme (inari · amber · lemon · kitsune)"),
                      ("b", "open the llama.cpp web UI"), ("↑ ↓ PgUp PgDn End", "scroll logs / requests"),
-                     ("q", "quit (managed servers: keep serving or stop)"), ("?", "toggle this help")):
+                     ("q", "quit (managed servers: keep serving or stop)"), ("?", "toggle this help")]
+        if self.router:
+            rows += [("m", "router: show the next loaded model"),
+                     ("8 → Enter / u / f", "router: load + monitor / unload / follow the busy model")]
+        for a, b in rows:
             t.add_row(a, b)
         return Panel(t, title=Text(" Help ", style=f"bold {p.accent}"), title_align="left", border_style=p.accent,
                      box=box.ROUNDED, padding=(1, 2))

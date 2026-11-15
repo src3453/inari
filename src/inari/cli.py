@@ -9,16 +9,23 @@ import sys
 from pathlib import Path
 
 from rich import box
+from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
+from rich.traceback import install as install_traceback
 
-from inari import __version__
-from inari import hfcache, hub, server
-from inari import theme as th
-from inari.config import Config, config_path, home
-from inari.profiles import Profile, list_profiles, new_profile
+# installed before anything else runs, so even a broken config.toml gets a readable traceback.
+# INARI_DEBUG=1 also shows local variables in each frame.
+install_traceback(console=Console(stderr=True), width=None, extra_lines=1,
+                  show_locals=os.environ.get("INARI_DEBUG", "") not in ("", "0"))
+
+from inari import __version__  # noqa: E402
+from inari import hfcache, hub, server  # noqa: E402
+from inari import theme as th  # noqa: E402
+from inari.config import Config, config_path, home  # noqa: E402
+from inari.profiles import Profile, list_profiles, new_profile  # noqa: E402
 
 cfg = Config.load()
 console = th.make_console(cfg.theme)
@@ -38,7 +45,7 @@ def rel_model(p: Path) -> str:
 
 
 # ───────────────────────── pull / models ─────────────────────────
-def cmd_hub(a: argparse.Namespace) -> None:
+def cmd_hub(a: argparse.Namespace):
     from inari.hubtui import HubApp
 
     app = HubApp(cfg, console, query=" ".join(getattr(a, "query", None) or []), theme_name=cfg.theme)
@@ -57,6 +64,7 @@ def cmd_hub(a: argparse.Namespace) -> None:
             console.print(f"[warn]■[/] [text]{j.group.name}[/] [dim]not finished — re-download resumes it[/]")
         elif j.status == "failed":
             console.print(f"[bad]✖[/] [text]{j.group.name}[/] [dim]{j.error}[/]")
+    return app
 
 
 def cmd_pull(a: argparse.Namespace) -> None:
@@ -256,6 +264,22 @@ def cmd_profile(a: argparse.Namespace) -> None:
             die(str(e))
 
 
+# ───────────────────────── setup wizard ─────────────────────────
+def cmd_setup(a: argparse.Namespace) -> None:
+    from inari.wizard import run_wizard
+
+    res = run_wizard(cfg, console, name=a.profile or "", start="advanced" if a.advanced else "")
+    if res is None:
+        console.print("[dim]setup cancelled — nothing saved[/]")
+        return
+    console.print(f"[good]✔ Profile[/] [accent]{res.name}[/] saved → [dim]{res.path}[/]")
+    show_profile(Profile.load(res.name))
+    if res.serve:
+        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+    else:
+        console.print(f"  run it: [accent]inari serve {res.name}[/]   ·   change it: [accent]inari setup {res.name}[/]")
+
+
 # ───────────────────────── serve / monitor ─────────────────────────
 def run_monitor(collector, *, managed: bool, run: server.RunInfo | None = None) -> None:
     from inari.tui import App
@@ -272,18 +296,43 @@ def run_monitor(collector, *, managed: bool, run: server.RunInfo | None = None) 
         cfg.save()
     if run is None:
         return
+    label = display_name(run.name)
     if result == "stop":
         with console.status("[accent]Stopping llama-server…[/]"):
             server.stop(run)
-        console.print(f"[good]✔ stopped[/] [accent]{run.name}[/]")
+        console.print(f"[good]✔ stopped[/] [accent]{label}[/]")
     elif run.alive():
-        console.print(f"[accent]●[/] [text]{run.name}[/] keeps serving at [accent2]{run.url}[/]  "
-                      f"[dim](inari monitor {run.name} · inari stop {run.name})[/]")
+        console.print(f"[accent]●[/] [text]{label}[/] keeps serving at [accent2]{run.url}[/]  "
+                      f"[dim](inari monitor {label} · inari stop {label})[/]")
+
+
+def display_name(run_name: str) -> str:
+    from inari import router
+
+    return "router" if run_name == router.NAME else run_name
+
+
+def run_name(name: str) -> str:
+    """CLI spelling -> RunInfo name (`router` -> `@router`, unless a profile is really called that)."""
+    from inari import router
+
+    if name in ("router", router.NAME) and not Profile.path_for("router").exists():
+        return router.NAME
+    return name
+
+
+def make_collector(run: server.RunInfo, popen=None):
+    from inari import router
+    from inari.collector import Collector, RouterCollector
+
+    cls = RouterCollector if run.name == router.NAME else Collector
+    return cls(run.url, log_path=run.log, pid=run.pid, name=display_name(run.name), cmd=run.cmd,
+               started=run.started, popen=popen)
 
 
 def cmd_serve(a: argparse.Namespace) -> None:
-    from inari.collector import Collector
-
+    if not getattr(a, "profile", None):
+        return cmd_serve_router(a)
     p = load_profile(a.profile)
     if a.port:
         p.port = a.port
@@ -299,17 +348,41 @@ def cmd_serve(a: argparse.Namespace) -> None:
     console.print(f"[accent]▶[/] started [accent]{p.name}[/] pid {run.pid} → [accent2]{run.url}[/]  [dim]log: {run.log}[/]")
     if a.no_tui:
         return
-    col = Collector(run.url, log_path=run.log, pid=run.pid, name=run.name, cmd=run.cmd, started=run.started, popen=proc)
-    run_monitor(col, managed=True, run=run)
+    run_monitor(make_collector(run, proc), managed=True, run=run)
+
+
+def cmd_serve_router(a: argparse.Namespace) -> None:
+    """`inari serve` with no profile: one llama-server in router mode, every profile a model preset."""
+    from inari import router
+
+    existing = server.find_run(router.NAME)
+    if existing:
+        console.print(f"[accent]●[/] router is already running (pid {existing.pid}) at "
+                      f"[accent2]{existing.url}[/] — attaching")
+        return attach(existing, getattr(a, "no_tui", False))
+    host = getattr(a, "host", None) or "127.0.0.1"
+    port = getattr(a, "port", None) or 8080
+    try:
+        run, proc, pre = router.launch(cfg, host=host, port=port, models_max=getattr(a, "models_max", None),
+                                       load=getattr(a, "load", None) or [])
+    except (FileNotFoundError, RuntimeError) as e:
+        die(str(e))
+        return
+    for w in pre.warnings:
+        console.print(f"[warn]·[/] [dim]{w}[/]")
+    names = ", ".join(pre.names) if pre.names else "none — only models in the HF cache"
+    console.print(f"[accent]▶[/] started [accent]router[/] pid {run.pid} → [accent2]{run.url}[/]  "
+                  f"[dim]profiles: {names}[/]")
+    console.print(f"  [dim]pick a model per request with \"model\": \"<profile>\" · log: {run.log}[/]", soft_wrap=True)
+    if getattr(a, "no_tui", False):
+        return
+    run_monitor(make_collector(run, proc), managed=True, run=run)
 
 
 def attach(run: server.RunInfo, no_tui: bool = False) -> None:
-    from inari.collector import Collector
-
     if no_tui:
         return
-    col = Collector(run.url, log_path=run.log, pid=run.pid, name=run.name, cmd=run.cmd, started=run.started)
-    run_monitor(col, managed=True, run=run)
+    run_monitor(make_collector(run), managed=True, run=run)
 
 
 def cmd_monitor(a: argparse.Namespace) -> None:
@@ -319,7 +392,9 @@ def cmd_monitor(a: argparse.Namespace) -> None:
         return run_monitor(Collector(a.url, name=a.url), managed=False)
     runs = server.active_runs()
     if a.profile:
-        run = next((r for r in runs if r.name == a.profile), None)
+        run = next((r for r in runs if r.name == run_name(a.profile)), None)
+        if not run and run_name(a.profile) != a.profile:
+            die("the router is not running — start it with: inari serve")
         if not run:
             p = load_profile(a.profile)
             console.print(f"[warn]{a.profile} wasn't started by inari — read-only monitor of {p.url()}[/]")
@@ -331,7 +406,7 @@ def cmd_monitor(a: argparse.Namespace) -> None:
     if len(runs) == 1:
         return attach(runs[0])
     for i, r in enumerate(runs, 1):
-        console.print(f"  [accent2]{i}[/] {r.name}  [dim]{r.url}[/]")
+        console.print(f"  [accent2]{i}[/] {display_name(r.name)}  [dim]{r.url}[/]")
     idx = Prompt.ask("[accent]Attach to #[/]", choices=[str(i) for i in range(1, len(runs) + 1)], console=console)
     attach(runs[int(idx) - 1])
 
@@ -344,18 +419,18 @@ def cmd_ps(a: argparse.Namespace) -> None:
         t.add_column(c, style="text")
     for r in server.active_runs():
         up = int(time.time() - r.started)
-        t.add_row(f"[accent]{r.name}[/]", str(r.pid), r.url, f"{up // 3600}h{up % 3600 // 60:02d}m", f"[dim]{r.log}[/]")
+        t.add_row(f"[accent]{display_name(r.name)}[/]", str(r.pid), r.url, f"{up // 3600}h{up % 3600 // 60:02d}m", f"[dim]{r.log}[/]")
     console.print(t)
 
 
 def cmd_stop(a: argparse.Namespace) -> None:
     runs = server.active_runs()
-    targets = runs if a.all else [r for r in runs if r.name == a.profile]
+    targets = runs if a.all else [r for r in runs if a.profile and r.name == run_name(a.profile)]
     if not targets:
         die("nothing to stop" if a.all or not a.profile else f"'{a.profile}' is not running")
     for r in targets:
         server.stop(r)
-        console.print(f"[good]✔ stopped[/] [accent]{r.name}[/] (pid {r.pid})")
+        console.print(f"[good]✔ stopped[/] [accent]{display_name(r.name)}[/] (pid {r.pid})")
 
 
 def cmd_demo(a: argparse.Namespace) -> None:
@@ -392,6 +467,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="inari", description="Golden TUI wrapper for llama.cpp's llama-server")
     ap.add_argument("-V", "--version", action="version", version=f"inari {__version__}")
     sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("setup", aliases=["onboard", "wizard"],
+                       help="guided setup: llama-server → model → context / GPU / chat → all args → profile")
+    s.add_argument("profile", nargs="?", help="profile to edit (or the name for a new one)")
+    s.add_argument("-a", "--advanced", action="store_true", help="open the all-settings table directly")
+    s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("pull", help="download a GGUF from Hugging Face (repo or repo:QUANT)")
     s.add_argument("repo", nargs="?", help="e.g. unsloth/Qwen3-8B-GGUF or unsloth/Qwen3-8B-GGUF:Q4_K_M "
@@ -436,9 +517,15 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("-y", "--yes", action="store_true")
     s.set_defaults(fn=cmd_profile)
 
-    s = sub.add_parser("serve", aliases=["run"], help="start llama-server from a profile and open the monitor")
-    s.add_argument("profile")
-    s.add_argument("--port", type=int)
+    s = sub.add_parser("serve", aliases=["run"],
+                       help="start llama-server and open the monitor (no profile: router mode, all profiles)")
+    s.add_argument("profile", nargs="?",
+                   help="profile to serve on its own; omit to start llama-server's router with every profile")
+    s.add_argument("--port", type=int, help="listen port (router default: 8080)")
+    s.add_argument("--host", help="router: listen address (default 127.0.0.1)")
+    s.add_argument("-l", "--load", action="append", metavar="PROFILE", help="router: load this model at startup")
+    s.add_argument("--models-max", type=int, metavar="N",
+                   help="router: max models loaded at once (llama.cpp default 4, 0 = unlimited)")
     s.add_argument("--no-tui", action="store_true", help="start in background and return")
     s.set_defaults(fn=cmd_serve)
 
@@ -451,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_ps)
 
     s = sub.add_parser("stop", help="stop a server started by inari")
-    s.add_argument("profile", nargs="?")
+    s.add_argument("profile", nargs="?", help="profile name, or `router`")
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_stop)
 
@@ -483,16 +570,79 @@ def main(argv: list[str] | None = None) -> None:
         else:
             ap.error(f"unrecognized arguments: {' '.join(unknown)}")
     if not getattr(a, "fn", None):
-        console.print(BANNER.format(v=__version__))
-        console.print()
-        for c, d in (("hub [QUERY]", "search Hugging Face + download (TUI)"),
-                     ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
-                     ("profile new|set|show|ls", "save llama-server arguments"), ("serve PROFILE", "launch + monitor"),
-                     ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
-                     ("demo", "try the monitor with a simulated server"), ("config", "settings")):
-            console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return main_menu()
+        print_help()
         return
     try:
         a.fn(a)
     except KeyboardInterrupt:
         console.print("[dim]interrupted[/]")
+
+
+# ───────────────────────── main menu (bare `inari`) ─────────────────────────
+def main_menu() -> None:
+    from inari.menu import Menu
+
+    select, flash = "", ""
+    while True:
+        try:
+            action, name = Menu(cfg, console, select=select, flash=flash).run()
+        except KeyboardInterrupt:
+            return
+        select, flash = name, ""
+        if action == "quit":
+            return
+        try:
+            if action == "serve":
+                cmd_serve(argparse.Namespace(profile=name, port=None, no_tui=False))
+            elif action == "router":
+                cmd_serve(argparse.Namespace(profile=None, port=None, no_tui=False))
+            elif action in ("new", "edit"):
+                from inari.wizard import run_wizard
+
+                res = run_wizard(cfg, console, name=name)
+                if res is None:
+                    flash = "setup cancelled — nothing saved"
+                else:
+                    select, flash = res.name, f"✔ profile {res.name} saved"
+                    if res.serve:
+                        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+            elif action == "stop":
+                run = server.find_run(name)
+                if run:
+                    with console.status(f"[accent]Stopping {name}…[/]"):
+                        server.stop(run)
+                    flash = f"✔ stopped {name}"
+            elif action == "hub":
+                app = cmd_hub(argparse.Namespace(query=[]))
+                done = [j for j in app.dl.jobs if j.status == "done"]
+                made = [j.profile for j in done if j.profile]
+                if made:
+                    select, flash = made[-1], f"✔ downloaded — profile {made[-1]} created"
+                elif done:
+                    flash = f"✔ downloaded {len(done)} model(s) — n to set up a profile for it"
+            elif action == "demo":
+                cmd_demo(argparse.Namespace())
+        except KeyboardInterrupt:
+            pass
+        except SystemExit:  # die() — the error is already printed above
+            try:
+                console.input("[dim]Enter to return to the menu[/] ")
+            except (KeyboardInterrupt, EOFError):
+                return
+
+
+def print_help() -> None:
+    console.print(BANNER.format(v=__version__))
+    console.print()
+    for c, d in (("", "main menu: pick a profile to serve, or set one up"),
+                 ("setup [PROFILE]", "guided setup wizard (start here)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
+                 ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
+                 ("profile new|set|show|ls", "save llama-server arguments"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
+                 ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
+                 ("demo", "try the monitor with a simulated server"), ("config", "settings")):
+        console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
+    if not list_profiles():
+        console.print()
+        console.print("  [accent2]No profiles yet — run[/] [accent]inari setup[/] [accent2]to make one.[/]")

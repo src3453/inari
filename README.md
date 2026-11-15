@@ -20,6 +20,28 @@ NVIDIA GPU で負荷・温度・電力も見たいときは: `uv sync --extra nv
 
 ## 使い方
 
+### メインメニュー
+
+```bash
+uv run inari                    # 引数なしで起動するとメインメニュー
+```
+
+保存済みプロファイルの一覧（モデル・ポート・起動状態）から選んで `Enter` で起動＆モニタ表示（起動中ならモニタに再接続）。`1`〜`9` で直接起動、`e` で選択中のプロファイルをセットアップウィザードで編集、`n` で新規セットアップ、`h` で Hub、`x` で起動中のサーバーを停止、`q` で終了。モニタやウィザードを閉じるとメニューに戻ります。全コマンドの一覧は `inari --help`（パイプ等で TTY でないときは従来どおりコマンド一覧を表示）。
+
+### セットアップウィザード（はじめての方はここから）
+
+```bash
+uv run inari setup              # = inari onboard。新しいプロファイルを対話的に作成
+uv run inari setup qwen3-8b     # 既存プロファイルを編集
+uv run inari setup qwen3-8b -a  # 全設定テーブル（Advanced）を直接開く
+```
+
+llama-server → モデル（`h` で Hub からダウンロード）→ 名前 → コンテキスト & KV キャッシュ → GPU オフロード → チャット / サンプリング → ネットワーク → **Advanced** → 確認・保存、の 9 ステップ。どのステップでも下部に「実行されるコマンド」が表示されます。
+
+- **Advanced** は、設定済み llama-server の `--help` から読み取った全フラグを `Default`（llama.cpp 既定）/ `Tuned`（inari の推奨）/ `Yours`（あなたの値）で一覧表示。`/` 絞り込み、`x` experimental のみ、`Enter` 編集、`←→` 選択肢切替、`Del` リセット、`a` 名前で追加、`c` コマンドをコピー、`u` Tuned 値の適用 on/off
+- **Tuned** は `llama-server --list-devices` の VRAM と GGUF メタデータ（学習時コンテキスト長、層数、MoE など）から計算
+- `--help` の解析結果はビルドごとに `~/.inari/cache/` にキャッシュ
+
 ```bash
 # Hugging Face を TUI で検索してダウンロード（→ 完了後 p でプロファイル作成）
 uv run inari hub qwen3 8b
@@ -37,7 +59,9 @@ uv run inari profile show qwen3-8b
 uv run inari profile ls
 
 # 起動してモニタ
-uv run inari serve qwen3-8b
+uv run inari serve              # router モード：全プロファイルを 1 ポートで（モデルは要求に応じてロード）
+uv run inari serve -l qwen3-8b  # router モード + 起動時に qwen3-8b をロード
+uv run inari serve qwen3-8b     # 1 プロファイルだけを単体で起動
 uv run inari monitor            # 再接続
 uv run inari monitor --url http://127.0.0.1:8080   # 外部で起動したサーバーを読み取り専用で監視
 uv run inari ps / inari stop qwen3-8b
@@ -45,6 +69,17 @@ uv run inari ps / inari stop qwen3-8b
 # モデル無しで TUI を試す
 uv run inari demo
 ```
+
+### router モード（`inari serve`）
+
+プロファイル名を付けずに `inari serve` を実行すると、llama-server を [router モード](https://github.com/ggml-org/llama.cpp/tree/master/tools/server#using-multiple-models) で起動し、そのままモニタを開きます。
+
+- すべてのプロファイルを、プロファイル名をセクション名にしたモデルプリセットとして `~/.inari/router/presets.ini` に書き出します（起動のたびに再生成）。HF キャッシュ内のモデルは llama-server 自身が一覧に追加します
+- リクエストの `"model": "<プロファイル名>"` で使うモデルを選びます。未ロードのモデルは最初のリクエストで自動的にロードされます
+- オプション：`--port`（既定 8080）、`--host`、`-l/--load PROFILE`（起動時にロード、複数指定可）、`--models-max N`（同時にロードするモデルの上限）
+- モニタの **8 Models** タブ：`Enter` でロードしてそのモデルのモニタを表示、`u` でアンロード。表示中のモデルは、処理中または最後にロードされたモデルに自動で切り替わります（`m` で手動で次のモデルへ、`f` で自動追従に戻す）。Requests にはモデル名の列が付きます
+- 再接続は `inari monitor router`、停止は `inari stop router`（各モデルのプロセスもまとめて停止）。メインメニューでは `r` で起動・再接続できます
+- プロファイルの `host` / `port` は router では使われません。`LLAMA_ARG_*` 以外の `env` は router 全体に適用されます
 
 ### プロファイルの書式
 
