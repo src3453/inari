@@ -409,6 +409,28 @@ def local_models(cfg: Config) -> list[LocalModel]:
     return out
 
 
+def model_files(m: LocalModel) -> list[Path]:
+    """Every file on disk that makes up ``m`` (all shards of a split model)."""
+    sm = SPLIT_RE.match(m.path.name)
+    if not sm:
+        return [m.path]
+    return sorted(m.path.parent.glob(sm.group("base") + "-*-of-*.gguf"))
+
+
+def delete_model(cfg: Config, m: LocalModel) -> int:
+    """Delete a local model (all shards). HF-cache entries also drop their unshared blobs. Returns bytes freed."""
+    if m.source == "hf":
+        parsed = hfcache.parse_ref(m.ref)
+        if parsed:
+            return hfcache.delete(cfg, *parsed)
+    freed = 0
+    for p in model_files(m):
+        size = p.stat().st_size
+        p.unlink()
+        freed += size
+    return freed
+
+
 # ───────────────────────── migrating old downloads ─────────────────────────
 @dataclass
 class _Legacy:

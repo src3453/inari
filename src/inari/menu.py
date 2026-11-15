@@ -17,6 +17,7 @@ from inari.config import Config
 from inari.hubtui import window
 from inari.inari_logo import banner
 from inari.keys import KeyReader
+from inari.modal import ConfirmModal
 from inari.profiles import Profile, list_profiles
 from inari.themepick import ThemePicker
 
@@ -41,13 +42,14 @@ ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded o
 
 class Menu:
     """``run()`` returns ``(action, profile_name)``:
-    serve · edit · stop · new · hub · demo · quit."""
+    serve · edit · stop · new · hub · demo · quit. Deleting a profile happens in place."""
 
     def __init__(self, cfg: Config, console: Console, *, select: str = "", flash: str = "") -> None:
         self.cfg = cfg
         self.console = console
         self.p = th.get(cfg.theme)
         self.picker = ThemePicker()
+        self.modal = ConfirmModal()
         self.rows: list[Row] = []
         self.sel = 0
         self.confirm: tuple[str, str, str] | None = None  # (question, action, name)
@@ -116,6 +118,9 @@ class Menu:
                 self.say(f"theme: {self.cfg.theme}")
             self.p = th.get(self.picker.name)
             return None
+        if self.modal.active:
+            self.modal.handle(key)
+            return None
         if key in ("ctrl+c", "q", "Q"):
             return ("quit", "")
         if self.confirm:
@@ -155,12 +160,41 @@ class Menu:
             return None
         if key == "e":
             return ("edit", row.name)
-        if key in ("x", "delete"):
+        if key in ("d", "delete"):
+            self.ask_delete(row)
+            return None
+        if key == "x":
             if not row.running:
                 self.say(f"{row.name} is not running")
                 return None
             self.confirm = (f"Stop {row.name}?", "stop", row.name)
         return None
+
+    def ask_delete(self, row: Row) -> None:
+        if row.running:
+            self.say(f"{row.name} is serving — stop it first (x)")
+            return
+        path = Profile.path_for(row.name)
+        p = self.p
+        lines = [Text.assemble(("Delete profile ", p.text), (row.name, f"bold {p.accent}"), ("?", p.text)),
+                 Text("")]
+        if row.model:
+            lines.append(Text.assemble(("model    ", p.dim), (row.model, p.text)))
+        lines.append(Text.assemble(("file     ", p.dim), (str(path), p.text)))
+        lines += [Text(""), Text("The model file itself is kept. This can't be undone.", style=p.warn)]
+
+        def do() -> None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                self.say(f"couldn't delete {row.name}: {e}")
+                return
+            self.refresh()
+            self.say(f"✔ deleted profile {row.name}")
+
+        self.modal.open("Delete profile", lines, do)
 
     def enter(self) -> tuple[str, str] | None:
         row = self.rows[self.sel]
@@ -183,7 +217,8 @@ class Menu:
         root.split_column(
             Layout(self.header(), size=4),
             Layout(Text("─" * w, style=p.dim), size=1),
-            Layout(self.picker.render(p) if self.picker.active else self.body(body_h), size=body_h),
+            Layout(self.picker.render(p) if self.picker.active else
+                   self.modal.render(p) if self.modal.active else self.body(body_h), size=body_h),
             Layout(self.status(), size=1),
             Layout(self.hints(), size=2),
         )
@@ -261,6 +296,8 @@ class Menu:
             items.append(("e", "edit (setup)"))
             if row.running:
                 items.append(("x", "stop"))
+            else:
+                items.append(("d", "delete"))
         items += [("r", "router"), ("n", "new profile"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
         t = Text()
         for key, label in items:

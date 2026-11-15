@@ -267,3 +267,76 @@ def scan(cfg: "Config", suffix: str = ".gguf") -> list[CachedFile]:
                 groups[key] = CachedFile(repo=repo, filename=rel, path=p, size=size)
         out.extend(groups.values())
     return out
+
+
+# ───────────────────────── deleting ─────────────────────────
+def shard_names(filename: str) -> Callable[[str], bool]:
+    """Matcher for every snapshot path that belongs to the logical model ``filename`` (all split shards)."""
+    m = SPLIT_RE.match(filename)
+    if not m:
+        return lambda rel: rel == filename
+    base = m.group("base")
+    return lambda rel: (sm := SPLIT_RE.match(rel)) is not None and sm.group("base") == base
+
+
+def _blob_of(link: Path, blobs: list[Path]) -> Path | None:
+    """The blob a snapshot entry stands for: symlink target, or the blob it is hard-linked with."""
+    try:
+        if link.is_symlink():
+            target = Path(os.path.abspath(link.parent / os.readlink(link)))
+            return target if target.exists() else None
+        return next((b for b in blobs if os.path.samefile(b, link)), None)
+    except OSError:
+        return None
+
+
+def delete(cfg: "Config", repo: str, filename: str) -> int:
+    """Remove ``filename`` (and its split shards) from every snapshot of ``repo``, plus the blobs nothing else
+    links to. Empty snapshots go too, and the whole repo folder once no snapshot is left. Returns bytes freed."""
+    rdir = repo_dir(cfg, repo)
+    bdir = rdir / "blobs"
+    blobs = [b for b in bdir.iterdir() if b.is_file()] if bdir.is_dir() else []
+    match = shard_names(filename)
+    freed = 0
+    dropped: set[Path] = set()
+    for snap in snapshot_dirs(rdir):
+        for p in list(snap.rglob("*")):
+            rel = p.relative_to(snap).as_posix()
+            if not match(rel) or not (p.is_symlink() or p.is_file()):
+                continue
+            blob = _blob_of(p, blobs)
+            if blob is not None:
+                dropped.add(blob)
+            elif p.is_file() and not p.is_symlink():  # real file (no blob behind it)
+                freed += p.stat().st_size
+            p.unlink()
+    # a blob is still needed if any remaining snapshot entry points at it
+    keep: set[Path] = set()
+    for snap in snapshot_dirs(rdir):
+        for p in snap.rglob("*"):
+            if p.is_symlink() or p.is_file():
+                b = _blob_of(p, blobs)
+                if b is not None:
+                    keep.add(b)
+    for b in dropped - keep:
+        try:
+            size = b.stat().st_size
+            b.unlink()
+            freed += size
+        except FileNotFoundError:
+            pass
+    for snap in snapshot_dirs(rdir):  # prune empty folders, deepest first
+        for d in sorted((q for q in snap.rglob("*") if q.is_dir() and not q.is_symlink()),
+                        key=lambda q: len(q.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            snap.rmdir()
+        except OSError:
+            pass
+    if not snapshot_dirs(rdir) and not any(b.name.endswith(PARTIAL_SUFFIX) for b in
+                                           (bdir.iterdir() if bdir.is_dir() else [])):
+        shutil.rmtree(rdir, ignore_errors=True)
+    return freed

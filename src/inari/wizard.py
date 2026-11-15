@@ -30,6 +30,7 @@ from inari.config import Config
 from inari.gguf import ModelInfo, read_info
 from inari.hubtui import window
 from inari.keys import KeyReader
+from inari.modal import ConfirmModal
 from inari.profiles import NAME_RE, Profile, list_profiles, parse_value
 from inari.tui import Bar
 
@@ -154,6 +155,7 @@ class Wizard:
         self.cmd_scroll = 0
         self.input: Input | None = None
         self.confirm: tuple[str, Callable[[], bool]] | None = None
+        self.modal = ConfirmModal()
         self.flash: tuple[str, float] | None = None
         self.result: Result | None = None
         self.exit_reason = ""
@@ -495,6 +497,9 @@ class Wizard:
     def handle(self, key: str) -> bool:
         if key == "ctrl+c":
             return True
+        if self.modal.active:
+            self.modal.handle(key)
+            return False
         if self.confirm:
             _, act = self.confirm
             self.confirm = None
@@ -622,9 +627,53 @@ class Wizard:
                 self.say(f"vision projector: {proj.name}")
         elif key == "r":
             self.models = self._scan_models()
+        elif key in ("d", "delete") and n:
+            self.ask_delete_model(self.models[self.msel])
         elif not self.common(key):
             self.msel = self.nav(key, self.msel, n)
         return False
+
+    def ask_delete_model(self, m: hub.LocalModel) -> None:
+        p = self.p
+        files = hub.model_files(m)
+        users = []
+        for name in list_profiles():
+            try:
+                if Profile.load(name).model == m.ref:
+                    users.append(name)
+            except Exception:
+                continue
+        lines = [Text.assemble(("Delete this model from disk?", p.text)), Text(""),
+                 Text.assemble(("model    ", p.dim), (m.ref, f"bold {p.accent}")),
+                 Text.assemble(("size     ", p.dim), (hub.human(m.size), p.text),
+                               (f"  ·  {len(files)} files" if len(files) > 1 else "", p.dim)),
+                 Text.assemble(("where    ", p.dim), ("Hugging Face cache (shared with llama.cpp -hf)"
+                                                       if m.source == "hf" else str(m.path.parent), p.text))]
+        if users:
+            lines.append(Text.assemble(("used by  ", p.dim), (", ".join(users), f"bold {p.warn}")))
+        if m.ref == self.model:
+            lines.append(Text("This is the model chosen for this profile.", style=p.warn))
+        lines += [Text(""), Text("The file is removed permanently — this can't be undone.", style=p.warn)]
+
+        def do() -> None:
+            try:
+                freed = hub.delete_model(self.cfg, m)
+            except PermissionError:
+                self.say(f"{m.path.name} is in use — stop the server using it first")
+                return
+            except OSError as e:
+                self.say(f"couldn't delete {m.path.name}: {e}")
+                return
+            if m.ref == self.model:
+                self.model, self.model_path, self.model_size, self.info = "", None, 0, None
+                self.mine.pop("mmproj", None)
+                self.dirty = True
+            self.models = self._scan_models()
+            self.msel = min(self.msel, max(len(self.models) - 1, 0))
+            self.say(f"✔ deleted {m.ref} — {hub.human(freed)} freed"
+                     + (f" · profiles now missing it: {', '.join(users)}" if users else ""))
+
+        self.modal.open("Delete model", lines, do)
 
     def key_form(self, key: str) -> bool:
         fs = self.fields()
@@ -764,7 +813,7 @@ class Wizard:
         if step == "server":
             return self.view_server()
         if step == "model":
-            return self.view_model(h)
+            return self.modal.render(self.p) if self.modal.active else self.view_model(h)
         if step == "advanced":
             return self.view_advanced(h)
         if step == "review":
@@ -1052,7 +1101,7 @@ class Wizard:
             items = [("Enter", "set path"), ("n", "next"), ("c", "copy command"), ("q", "quit")]
         elif step == "model":
             items = [("↑↓", "choose"), ("Enter", "use"), ("h", "download from Hub"), ("p", "path"),
-                     ("m", "mmproj"), ("n", "next"), ("Esc", "back")]
+                     ("m", "mmproj"), ("d", "delete"), ("n", "next"), ("Esc", "back")]
         elif step == "advanced":
             items = [("n", "next"), ("↑↓", "choose"), ("Enter", "edit"), ("←→", "cycle"), ("Esc", "back"),
                      ("Del", "reset"), ("x", "experimental"), ("/", "filter"), ("a", "add by name"),
