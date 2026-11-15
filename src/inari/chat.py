@@ -34,6 +34,143 @@ HELP = [("/help", "this list"),
         ("/exit", "leave (also /quit, /bye, Ctrl+D, Ctrl+C at an empty prompt)"),
         ('"""', "start / end a multi-line message (or end a line with \\ to continue it)")]
 
+# what the input line offers while a /command is typed: (inserted text, description)
+COMMANDS = [("/help", "list the commands"),
+            ("/clear", "new conversation + clear the screen"),
+            ("/regen", "answer the last message again"),
+            ("/undo", "drop the last exchange"),
+            ("/system ", "show or set the system prompt"),
+            ("/think", "show / hide the model's reasoning"),
+            ("/md", "Markdown rendering on / off"),
+            ("/info", "model, server and conversation size"),
+            ("/exit", "leave")]
+ALIASES = {"/new": "/clear", "/reset": "/clear", "/retry": "/regen", "/markdown": "/md", "/plain": "/md",
+           "/quit": "/exit", "/bye": "/exit", "/q": "/exit", "/?": "/help"}
+
+
+def make_session(console: Console):
+    """A prompt_toolkit session with /command suggestions, or None (not a terminal / not installed)."""
+    import sys
+
+    if not (console.is_terminal and sys.stdin.isatty()):
+        return None
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.application import get_app
+        from prompt_toolkit.filters import Condition, has_focus
+        from prompt_toolkit.history import InMemoryHistory
+        from prompt_toolkit.layout import Dimension, Float, FloatContainer, HSplit, ScrollOffsets, Window
+        from prompt_toolkit.layout.margins import ScrollbarMargin
+        from prompt_toolkit.layout.menus import CompletionsMenu, CompletionsMenuControl, MultiColumnCompletionsMenu
+        from prompt_toolkit.styles import Style
+    except ImportError:
+        console.print("[dim]  (no command suggestions: prompt-toolkit is not installed in this environment)[/]")
+        return None
+
+    menu_h = len(COMMANDS)  # the most rows the list ever needs (everything, after a bare "/")
+
+    class SuggestSession(PromptSession):
+        """PromptSession whose suggestion list never moves the input line: it floats in the free rows below
+        the line, or — when the line sits at the bottom of the screen — is stacked above it. The side is
+        picked when the list first opens and kept for the rest of that prompt; above, rows the shrinking
+        list gives back are kept as blank padding so the line stays put."""
+
+        def __init__(self, *a, **kw) -> None:
+            self.menu_above: bool | None = None
+            self.menu_peak = 0
+            super().__init__(*a, **kw)
+
+        def prompt(self, *a, **kw):
+            self.menu_above, self.menu_peak = None, 0
+            return super().prompt(*a, **kw)
+
+        def _rows(self) -> int:
+            """Rows the list takes right now (0 = closed)."""
+            st = self.default_buffer.complete_state
+            if get_app().is_done or not st or not st.completions:
+                return 0
+            return min(len(st.completions), menu_h)
+
+        def _above(self) -> bool:
+            if self.menu_above is None and self._rows():
+                try:  # rows free under the (single) input line
+                    r = get_app().renderer
+                    free = r.output.get_size().rows - r.rows_above_layout - 1
+                except Exception:  # unknown yet → assume the bottom, which never needs room below
+                    free = 0
+                self.menu_above = free < menu_h
+            return bool(self.menu_above)
+
+        def _above_rows(self) -> int:
+            rows = self._rows() if self._above() else 0
+            self.menu_peak = max(self.menu_peak, rows)
+            return rows
+
+        def _pad_rows(self) -> int:
+            rows = self._above_rows()  # first: it may raise the peak
+            return 0 if get_app().is_done else self.menu_peak - rows
+
+        def _create_layout(self):
+            layout = super()._create_layout()
+            focused = has_focus(self.default_buffer)
+            stack = [layout.container]
+            while stack:
+                c = stack.pop()
+                if isinstance(c, FloatContainer) and isinstance(c.content, HSplit):
+                    c.floats = [f for f in c.floats
+                                if not isinstance(f.content, (CompletionsMenu, MultiColumnCompletionsMenu))]
+                    c.floats.insert(0, Float(xcursor=True, ycursor=True, transparent=True, content=CompletionsMenu(
+                        max_height=menu_h, scroll_offset=1, extra_filter=focused & ~Condition(self._above))))
+                    c.content.children[0:0] = [
+                        Window(height=lambda: Dimension.exact(self._pad_rows())),
+                        Window(CompletionsMenuControl(), height=lambda: Dimension.exact(self._above_rows()),
+                               dont_extend_width=True, scroll_offsets=ScrollOffsets(top=1, bottom=1), style="class:completion-menu",
+                               right_margins=[ScrollbarMargin(display_arrows=False)]),
+                    ]
+                    return layout
+                stack.extend(c.get_children())
+            return layout
+
+    class CommandCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("/") or " " in text or "\n" in document.text:
+                return
+            word = text.lower()
+            seen = set()
+            for name, desc in COMMANDS:
+                if name.startswith(word):
+                    seen.add(name.strip())
+                    yield Completion(name, start_position=-len(text), display=name.strip(), display_meta=desc)
+            for alias, target in ALIASES.items():  # aliases only once they are typed out further than the target
+                if alias.startswith(word) and target not in seen and len(word) > 1:
+                    yield Completion(alias, start_position=-len(text), display_meta=f"= {target}")
+
+    def hex_of(name: str, fallback: str) -> str:
+        try:
+            c = console.get_style(name).color
+            return c.get_truecolor().hex if c else fallback
+        except Exception:
+            return fallback
+
+    accent = hex_of("accent", "#e8b830")
+    style = Style.from_dict({
+        "prompt": f"{accent} bold",
+        "cont": "#808080",
+        "completion-menu.completion": "bg:#262626 #c8c8c8",
+        "completion-menu.completion.current": f"bg:{accent} #000000",
+        "completion-menu.meta.completion": "bg:#262626 #808080",
+        "completion-menu.meta.completion.current": f"bg:{accent} #000000",
+        "scrollbar.background": "bg:#3a3a3a",
+        "scrollbar.button": f"bg:{accent}",
+    })
+    try:
+        return SuggestSession(completer=CommandCompleter(), complete_while_typing=True, history=InMemoryHistory(),
+                             style=style, reserve_space_for_menu=0)
+    except Exception:  # e.g. no Windows console behind stdout (mintty) → plain input
+        return None
+
 
 class ChatError(RuntimeError):
     pass
@@ -185,6 +322,7 @@ class Chat:
         self.params = dict(params or {})
         self.show_reasoning = show_reasoning
         self.history: list[dict] = []
+        self.session = None  # prompt_toolkit input line, set up when the interactive loop starts
 
     # ───────── requests ─────────
     def messages(self) -> list[dict]:
@@ -344,8 +482,13 @@ class Chat:
         lines: list[str] = []
         block = False
         while True:
+            first = not lines and not block
             try:
-                line = self.console.input("[accent]› [/]" if not lines and not block else "[dim]… [/]")
+                if self.session is not None:
+                    line = self.session.prompt([("class:prompt", "› ")] if first else [("class:cont", "… ")],
+                                               complete_while_typing=first)
+                else:
+                    line = self.console.input("[accent]› [/]" if first else "[dim]… [/]")
             except EOFError:
                 return None
             except KeyboardInterrupt:
@@ -385,6 +528,9 @@ class Chat:
                 self.console.print(f"  [accent]{escape(k):<16}[/] [dim]{escape(d)}[/]")
         elif cmd in ("/clear", "/new", "/reset"):
             self.history.clear()
+            if self.console.is_terminal:
+                self.console.clear()
+                self.intro()
             self.console.print("[dim]  new conversation[/]")
         elif cmd in ("/regen", "/retry"):
             if self.history and self.history[-1]["role"] == "assistant":
@@ -423,6 +569,7 @@ class Chat:
         return True
 
     def loop(self) -> None:
+        self.session = make_session(self.console)
         self.intro()
         while True:
             text = self.read()
