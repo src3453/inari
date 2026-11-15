@@ -92,6 +92,15 @@ def build_number(binary: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def list_devices(binary: str | None) -> list[str]:
+    """GPUs llama-server can use (``--list-devices``); empty when its GPU backend didn't load."""
+    if not binary:
+        return []
+    out = _run([binary, "--list-devices"], timeout=30)
+    _, _, tail = out.partition("Available devices:")
+    return [ln.strip() for ln in tail.splitlines() if ln.strip() and ln.strip() != "(none)" and ":" in ln]
+
+
 def _os_arch() -> tuple[str, str]:
     osk = {"win32": "win", "darwin": "macos"}.get(sys.platform, "ubuntu")
     mach = platform.machine().lower()
@@ -123,7 +132,9 @@ def detect_variant(cfg: Config) -> str:
             names = ""
         for lib, v in (("ggml-cuda", "cuda"), ("ggml-hip", "rocm"), ("ggml-vulkan", "vulkan"), ("ggml-sycl", "sycl")):
             if lib in names:
-                return v
+                # the official Windows ROCm zips don't bundle hipBLAS / rocBLAS (ggml-hip.dll won't load without a
+                # matching HIP SDK), so AMD GPUs get the self-contained Vulkan build unless update_variant says rocm
+                return "vulkan" if v == "rocm" and osk == "win" else v
         if "ggml-cpu" in names:
             return "cpu"
     return "cuda" if cuda_driver_version() else "vulkan"
@@ -354,6 +365,11 @@ def install(info: UpdateInfo, progress: Progress | None = None, cancel: threadin
         out = _run([str(binary), "--version"]).strip().splitlines()
         raise RuntimeError(f"the new llama-server doesn't run: {out[-1] if out else 'no output'}"
                            f" (left in {final})")
+    if info.variant != "cpu" and not list_devices(str(binary)) and list_devices(info.current_binary):
+        # its GPU backend didn't load (missing runtime DLLs, unsupported GPU …): it would silently run on the CPU
+        shutil.rmtree(final, ignore_errors=True)
+        raise RuntimeError(f"the {info.flavor} build sees no GPU here (the build in use does) — kept the current "
+                           f"one; try another variant: inari update --variant vulkan")
     for f in files:
         f.unlink(missing_ok=True)
     st = load_state()
