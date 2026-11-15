@@ -4,28 +4,34 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from rich import box
+from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
+from rich.traceback import install as install_traceback
 
-from inari import __version__
-from inari import hub, server
-from inari import theme as th
-from inari.config import Config, config_path, home
-from inari.profiles import Profile, list_profiles, new_profile
+# installed before anything else runs, so even a broken config.toml gets a readable traceback.
+# INARI_DEBUG=1 also shows local variables in each frame.
+install_traceback(console=Console(stderr=True), width=None, extra_lines=1,
+                  show_locals=os.environ.get("INARI_DEBUG", "") not in ("", "0"))
+
+from inari import __version__  # noqa: E402
+from inari import hfcache, hub, server  # noqa: E402
+from inari import theme as th  # noqa: E402
+from inari.config import Config, config_path, home  # noqa: E402
+from inari.profiles import Profile, list_profiles, new_profile  # noqa: E402
 
 cfg = Config.load()
 console = th.make_console(cfg.theme)
 
-BANNER = r"""[accent]  ╦╔╗╔╔═╗╦═╗╦[/]
-[accent]  ║║║║╠═╣╠╦╝║[/]   [dim]llama.cpp, served golden[/]
-[accent]  ╩╝╚╝╩ ╩╩╚═╩[/]   [dim]v{v}[/]"""
+
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -34,14 +40,11 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def rel_model(p: Path) -> str:
-    try:
-        return str(p.resolve().relative_to(cfg.models_path().resolve())).replace("\\", "/")
-    except ValueError:
-        return str(p)
+    return hub.model_ref(cfg, p)
 
 
 # ───────────────────────── pull / models ─────────────────────────
-def cmd_hub(a: argparse.Namespace) -> None:
+def cmd_hub(a: argparse.Namespace):
     from inari.hubtui import HubApp
 
     app = HubApp(cfg, console, query=" ".join(getattr(a, "query", None) or []), theme_name=cfg.theme)
@@ -49,8 +52,8 @@ def cmd_hub(a: argparse.Namespace) -> None:
         app.run()
     except KeyboardInterrupt:
         pass
-    if app.theme_name != cfg.theme:
-        cfg.theme = app.theme_name
+    if app.theme_name != cfg.theme or app.dl.backend != cfg.download_backend:
+        cfg.theme, cfg.download_backend = app.theme_name, app.dl.backend
         cfg.save()
     for j in app.dl.jobs:
         if j.status == "done":
@@ -60,13 +63,14 @@ def cmd_hub(a: argparse.Namespace) -> None:
             console.print(f"[warn]■[/] [text]{j.group.name}[/] [dim]not finished — re-download resumes it[/]")
         elif j.status == "failed":
             console.print(f"[bad]✖[/] [text]{j.group.name}[/] [dim]{j.error}[/]")
+    return app
 
 
 def cmd_pull(a: argparse.Namespace) -> None:
     if not a.repo:
         return cmd_hub(argparse.Namespace(query=[]))
     try:
-        model, mmproj = hub.pull(a.repo, cfg, console, yes=a.yes)
+        model, mmproj = hub.pull(a.repo, cfg, console, yes=a.yes, backend=a.via or "")
     except Exception as e:  # network / auth / 404
         die(f"download failed: {e}")
     if model is None:
@@ -78,24 +82,66 @@ def cmd_pull(a: argparse.Namespace) -> None:
     if name:
         prof = new_profile(name, model=rel_model(model), description=f"from {a.repo}")
         if mmproj:
-            prof.args["mmproj"] = str(mmproj)
+            prof.args["mmproj"] = rel_model(mmproj)
         prof.save()
         console.print(f"[good]✔ Profile[/] [accent]{name}[/] saved → [dim]{Profile.path_for(name)}[/]")
         console.print(f"  run it: [accent]inari serve {name}[/]")
 
 
 def cmd_models(a: argparse.Namespace) -> None:
+    if getattr(a, "action", None) == "migrate":
+        return cmd_migrate(a)
     items = hub.local_models(cfg)
-    t = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="accent",
-              title=f"[accent]Local models[/] [dim]{cfg.models_path()}[/]")
+    t = Table(box=box.SIMPLE_HEAD, border_style="dim", header_style="accent", title="[accent]Local models[/]")
     t.add_column("#", style="accent2", justify="right")
     t.add_column("MODEL", style="text")
     t.add_column("SIZE", justify="right", style="text")
-    for i, (p, size) in enumerate(items, 1):
-        t.add_row(str(i), rel_model(p), hub.human(size))
+    t.add_column("IN", style="dim")
+    for i, m in enumerate(items, 1):
+        t.add_row(str(i), m.ref, hub.human(m.size), m.source)
     if not items:
-        t.add_row("", "[dim]none yet — try: inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M[/]", "")
+        t.add_row("", "[dim]none yet — try: inari pull unsloth/Qwen3-8B-GGUF:Q4_K_M[/]", "", "")
     console.print(t)
+    console.print(f"[dim]  hf  → {hfcache.cache_dir(cfg)}  (shared with llama-server -hf)[/]", soft_wrap=True)
+    console.print(f"[dim]  dir → {cfg.models_path()}[/]", soft_wrap=True)
+    if any(m.source == "dir" and "__" in Path(m.ref).parts[0] for m in items):
+        console.print("[dim]Old inari downloads found in models_dir — [accent]inari models migrate[/] moves them "
+                      "into the HF cache so llama-server -hf can use them too.[/]")
+
+
+def cmd_migrate(a: argparse.Namespace) -> None:
+    moved = hub.migrate(cfg, console, yes=a.yes)
+    if not moved:
+        return
+    # profiles may point at the old files by relative or absolute path
+    old = {}
+    for path, ref in moved.items():
+        old[path] = ref
+        old[rel_model(Path(path))] = ref  # still relative to models_dir (the file is gone, the string is not)
+        try:
+            old[Path(path).relative_to(cfg.models_path()).as_posix()] = ref
+        except ValueError:
+            pass
+    norm = {k.replace("\\", "/"): v for k, v in old.items()}
+
+    def swap(v):
+        if isinstance(v, str):
+            return norm.get(v.replace("\\", "/"), v)
+        if isinstance(v, list):
+            return [swap(x) for x in v]
+        return v
+
+    for n in list_profiles():
+        try:
+            p = Profile.load(n)
+        except Exception:
+            continue
+        before = (p.model, dict(p.args))
+        p.model = swap(p.model)
+        p.args = {k_: swap(v) for k_, v in p.args.items()}
+        if (p.model, p.args) != before:
+            p.save()
+            console.print(f"[good]✔ profile[/] [accent]{n}[/] [dim]now uses {p.model}[/]")
 
 
 # ───────────────────────── profiles ─────────────────────────
@@ -140,7 +186,7 @@ def pick_model_interactive() -> str:
     cmd_models(argparse.Namespace())
     idx = Prompt.ask("[accent]Model #[/] (or a path)", console=console)
     if idx.isdigit() and 1 <= int(idx) <= len(items):
-        return rel_model(items[int(idx) - 1][0])
+        return items[int(idx) - 1].ref
     return idx
 
 
@@ -217,6 +263,169 @@ def cmd_profile(a: argparse.Namespace) -> None:
             die(str(e))
 
 
+# ───────────────────────── setup wizard ─────────────────────────
+def cmd_setup(a: argparse.Namespace) -> None:
+    from inari.wizard import run_wizard
+
+    res = run_wizard(cfg, console, name=a.profile or "", start="advanced" if a.advanced else "")
+    if res is None:
+        console.print("[dim]setup cancelled — nothing saved[/]")
+        return
+    console.print(f"[good]✔ Profile[/] [accent]{res.name}[/] saved → [dim]{res.path}[/]")
+    show_profile(Profile.load(res.name))
+    if res.serve:
+        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+    else:
+        console.print(f"  run it: [accent]inari serve {res.name}[/]   ·   change it: [accent]inari setup {res.name}[/]")
+
+
+# ───────────────────────── import a llama-server command ─────────────────────────
+def read_command_interactive() -> str:
+    console.print("[accent]Paste your llama-server command[/] [dim](line continuations \\ ^ ` are fine; "
+                  "empty line to finish)[/]")
+    lines: list[str] = []
+    while True:
+        try:
+            line = console.input("[accent2]› [/]" if not lines else "[dim]… [/]")
+        except EOFError:
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def import_command(text: str, *, name: str = "", yes: bool = False, via: str = "", wizard: bool = True):
+    """Parse ``text``, download the model if needed, then open the setup wizard on Review (or save directly).
+    Returns the wizard Result, the saved Profile (``wizard=False``) or None."""
+    from inari import argspec, importer
+    from inari.wizard import free_port, run_wizard
+
+    if not text.strip():
+        console.print("[dim]nothing pasted — nothing imported[/]")
+        return None
+    tokens, _ = importer.split_statements(text)
+    binary = ""
+    if tokens and not tokens[0].startswith("-"):
+        cand = Path(tokens[0]).expanduser()
+        binary = str(cand) if cand.is_file() else (shutil.which(tokens[0]) or "")
+    with console.status("[accent]Reading llama-server settings…[/]"):
+        cat = argspec.load(cfg, binary or None)
+    imp = importer.parse(text, cat, cfg)
+
+    # ── what we understood ──
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", no_wrap=True)
+    t.add_column(style="text", overflow="fold")
+    t.add_row("binary", imp.binary or "—")
+    if imp.hf:
+        target = imp.hf.repo + (f":{imp.hf.quant}" if imp.hf.quant else "") + (f"  {imp.hf.file}" if imp.hf.file else "")
+        t.add_row("model", f"{imp.model or target}" + ("" if imp.model else "  [warn](not downloaded yet)[/]"))
+    else:
+        t.add_row("model", (imp.model or "[bad]none[/]") +
+                  ("" if not imp.model or imp.model_path else "  [bad](missing)[/]"))
+    if imp.host or imp.port:
+        t.add_row("listen", f"{imp.host or '127.0.0.1'}:{imp.port or '(free port)'}")
+    for k_, v in imp.args.items():
+        t.add_row(f"[accent2]{k_}[/]", str(v))
+    if imp.extra:
+        t.add_row("extra", " ".join(imp.extra))
+    for k_, v in imp.env.items():
+        t.add_row(f"env.{k_}", v)
+    console.print(Panel(t, title="[accent] imported [/]", title_align="left", border_style="dim", box=box.ROUNDED))
+    for n in imp.notes:
+        console.print(f"  [warn]·[/] [dim]{n}[/]", soft_wrap=True)
+
+    # ── fetch the model when the command used -hf / a Hugging Face URL ──
+    if imp.needs_fetch:
+        try:
+            with console.status(f"[accent]Looking up[/] [text]{imp.hf.repo}[/] …"):
+                pl = importer.plan(cfg, imp)
+        except Exception as e:  # network / auth / 404 / no match
+            console.print(f"[bad]✖[/] could not look up the model: {e}")
+            pl = None
+        if pl and len(pl.choices) > 1 and not yes:
+            for i, g in enumerate(pl.choices, 1):
+                console.print(f"  [accent2]{i:>2}[/] {g.name}  [dim]{g.quant} · {hub.human(g.size)}[/]")
+            idx = Prompt.ask("[accent]Several files match — which #[/]",
+                             choices=[str(i) for i in range(1, len(pl.choices) + 1)], default="1",
+                             show_choices=False, console=console)
+            pl.model = pl.choices[int(idx) - 1]
+        if pl and importer.link_existing(cfg, imp, pl):
+            console.print(f"[good]✔[/] already in the HF cache: [text]{imp.model}[/]")
+        elif pl:
+            what = pl.model.name + (f" + {pl.mmproj.name}" if pl.mmproj else "")
+            console.print(f"  [dim]→ {hfcache.repo_dir(cfg, pl.repo)}[/]", soft_wrap=True)
+            if yes or Confirm.ask(f"[accent]Download[/] [text]{what}[/] ([accent2]{hub.human(pl.size)}[/])?",
+                                  default=True, console=console):
+                try:
+                    importer.fetch(cfg, imp, pl, console, backend=via)
+                    console.print(f"[good]✔ Downloaded[/] [text]{imp.model}[/]")
+                except Exception as e:
+                    console.print(f"[bad]✖[/] download failed: {e}")
+        if not imp.model:
+            console.print("[warn]·[/] [dim]no model yet — pick or download one in the wizard[/]")
+
+    # ── the profile ──
+    prof = new_profile(name or imp.suggested_name(), model=imp.model, description="imported from a command")
+    prof.args = dict(imp.args)
+    prof.extra, prof.env = list(imp.extra), dict(imp.env)
+    prof.host = imp.host or prof.host
+    prof.port = imp.port or free_port()
+    if binary and not (cfg.server_binary() and importer.same_binary(binary, cfg.server_binary())):
+        if cfg.server_binary():
+            prof.server_bin = binary  # this command used another build: keep using it for this profile
+        else:
+            cfg.llama_server = binary
+            cfg.save()
+            console.print(f"[good]✔[/] llama_server set to [text]{binary}[/]")
+
+    if not wizard:
+        if not prof.model:
+            die("no model — run again without -y to pick one in the wizard")
+        base, n = prof.name, 2
+        while Profile.path_for(prof.name).exists() and not name:
+            prof.name, n = f"{base}-{n}", n + 1
+        prof.save()
+        console.print(f"[good]✔ Profile[/] [accent]{prof.name}[/] saved → [dim]{Profile.path_for(prof.name)}[/]")
+        show_profile(prof)
+        return prof
+    if not yes:
+        console.input("[dim]Enter to review it in the setup wizard[/] ")
+    return run_wizard(cfg, console, seed=prof, start="review" if prof.model else "model",
+                      origin="imported from a llama-server command")
+
+
+def cmd_import(a: argparse.Namespace) -> None:
+    if a.file:
+        try:
+            text = Path(a.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            die(f"cannot read {a.file}: {e}")
+            return
+    elif a.command:
+        text = a.command[0] if len(a.command) == 1 else subprocess.list2cmdline(a.command)
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        text = read_command_interactive()
+    res = import_command(text, name=a.profile or "", yes=a.yes, via=a.via or "", wizard=not a.yes)
+    if res is None:
+        console.print("[dim]import cancelled — nothing saved[/]")
+        return
+    if isinstance(res, Profile):
+        console.print(f"  run it: [accent]inari serve {res.name}[/]")
+        return
+    console.print(f"[good]✔ Profile[/] [accent]{res.name}[/] saved → [dim]{res.path}[/]")
+    show_profile(Profile.load(res.name))
+    if res.serve:
+        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+    else:
+        console.print(f"  run it: [accent]inari serve {res.name}[/]   ·   change it: [accent]inari setup {res.name}[/]")
+
+
 # ───────────────────────── serve / monitor ─────────────────────────
 def run_monitor(collector, *, managed: bool, run: server.RunInfo | None = None) -> None:
     from inari.tui import App
@@ -233,18 +442,43 @@ def run_monitor(collector, *, managed: bool, run: server.RunInfo | None = None) 
         cfg.save()
     if run is None:
         return
+    label = display_name(run.name)
     if result == "stop":
         with console.status("[accent]Stopping llama-server…[/]"):
             server.stop(run)
-        console.print(f"[good]✔ stopped[/] [accent]{run.name}[/]")
+        console.print(f"[good]✔ stopped[/] [accent]{label}[/]")
     elif run.alive():
-        console.print(f"[accent]●[/] [text]{run.name}[/] keeps serving at [accent2]{run.url}[/]  "
-                      f"[dim](inari monitor {run.name} · inari stop {run.name})[/]")
+        console.print(f"[accent]●[/] [text]{label}[/] keeps serving at [accent2]{run.url}[/]  "
+                      f"[dim](inari monitor {label} · inari stop {label})[/]")
+
+
+def display_name(run_name: str) -> str:
+    from inari import router
+
+    return "router" if run_name == router.NAME else run_name
+
+
+def run_name(name: str) -> str:
+    """CLI spelling -> RunInfo name (`router` -> `@router`, unless a profile is really called that)."""
+    from inari import router
+
+    if name in ("router", router.NAME) and not Profile.path_for("router").exists():
+        return router.NAME
+    return name
+
+
+def make_collector(run: server.RunInfo, popen=None):
+    from inari import router
+    from inari.collector import Collector, RouterCollector
+
+    cls = RouterCollector if run.name == router.NAME else Collector
+    return cls(run.url, log_path=run.log, pid=run.pid, name=display_name(run.name), cmd=run.cmd,
+               started=run.started, popen=popen)
 
 
 def cmd_serve(a: argparse.Namespace) -> None:
-    from inari.collector import Collector
-
+    if not getattr(a, "profile", None):
+        return cmd_serve_router(a)
     p = load_profile(a.profile)
     if a.port:
         p.port = a.port
@@ -260,17 +494,41 @@ def cmd_serve(a: argparse.Namespace) -> None:
     console.print(f"[accent]▶[/] started [accent]{p.name}[/] pid {run.pid} → [accent2]{run.url}[/]  [dim]log: {run.log}[/]")
     if a.no_tui:
         return
-    col = Collector(run.url, log_path=run.log, pid=run.pid, name=run.name, cmd=run.cmd, started=run.started, popen=proc)
-    run_monitor(col, managed=True, run=run)
+    run_monitor(make_collector(run, proc), managed=True, run=run)
+
+
+def cmd_serve_router(a: argparse.Namespace) -> None:
+    """`inari serve` with no profile: one llama-server in router mode, every profile a model preset."""
+    from inari import router
+
+    existing = server.find_run(router.NAME)
+    if existing:
+        console.print(f"[accent]●[/] router is already running (pid {existing.pid}) at "
+                      f"[accent2]{existing.url}[/] — attaching")
+        return attach(existing, getattr(a, "no_tui", False))
+    host = getattr(a, "host", None) or "127.0.0.1"
+    port = getattr(a, "port", None) or 8080
+    try:
+        run, proc, pre = router.launch(cfg, host=host, port=port, models_max=getattr(a, "models_max", None),
+                                       load=getattr(a, "load", None) or [])
+    except (FileNotFoundError, RuntimeError) as e:
+        die(str(e))
+        return
+    for w in pre.warnings:
+        console.print(f"[warn]·[/] [dim]{w}[/]")
+    names = ", ".join(pre.names) if pre.names else "none — only models in the HF cache"
+    console.print(f"[accent]▶[/] started [accent]router[/] pid {run.pid} → [accent2]{run.url}[/]  "
+                  f"[dim]profiles: {names}[/]")
+    console.print(f"  [dim]pick a model per request with \"model\": \"<profile>\" · log: {run.log}[/]", soft_wrap=True)
+    if getattr(a, "no_tui", False):
+        return
+    run_monitor(make_collector(run, proc), managed=True, run=run)
 
 
 def attach(run: server.RunInfo, no_tui: bool = False) -> None:
-    from inari.collector import Collector
-
     if no_tui:
         return
-    col = Collector(run.url, log_path=run.log, pid=run.pid, name=run.name, cmd=run.cmd, started=run.started)
-    run_monitor(col, managed=True, run=run)
+    run_monitor(make_collector(run), managed=True, run=run)
 
 
 def cmd_monitor(a: argparse.Namespace) -> None:
@@ -280,7 +538,9 @@ def cmd_monitor(a: argparse.Namespace) -> None:
         return run_monitor(Collector(a.url, name=a.url), managed=False)
     runs = server.active_runs()
     if a.profile:
-        run = next((r for r in runs if r.name == a.profile), None)
+        run = next((r for r in runs if r.name == run_name(a.profile)), None)
+        if not run and run_name(a.profile) != a.profile:
+            die("the router is not running — start it with: inari serve")
         if not run:
             p = load_profile(a.profile)
             console.print(f"[warn]{a.profile} wasn't started by inari — read-only monitor of {p.url()}[/]")
@@ -292,7 +552,7 @@ def cmd_monitor(a: argparse.Namespace) -> None:
     if len(runs) == 1:
         return attach(runs[0])
     for i, r in enumerate(runs, 1):
-        console.print(f"  [accent2]{i}[/] {r.name}  [dim]{r.url}[/]")
+        console.print(f"  [accent2]{i}[/] {display_name(r.name)}  [dim]{r.url}[/]")
     idx = Prompt.ask("[accent]Attach to #[/]", choices=[str(i) for i in range(1, len(runs) + 1)], console=console)
     attach(runs[int(idx) - 1])
 
@@ -305,18 +565,18 @@ def cmd_ps(a: argparse.Namespace) -> None:
         t.add_column(c, style="text")
     for r in server.active_runs():
         up = int(time.time() - r.started)
-        t.add_row(f"[accent]{r.name}[/]", str(r.pid), r.url, f"{up // 3600}h{up % 3600 // 60:02d}m", f"[dim]{r.log}[/]")
+        t.add_row(f"[accent]{display_name(r.name)}[/]", str(r.pid), r.url, f"{up // 3600}h{up % 3600 // 60:02d}m", f"[dim]{r.log}[/]")
     console.print(t)
 
 
 def cmd_stop(a: argparse.Namespace) -> None:
     runs = server.active_runs()
-    targets = runs if a.all else [r for r in runs if r.name == a.profile]
+    targets = runs if a.all else [r for r in runs if a.profile and r.name == run_name(a.profile)]
     if not targets:
         die("nothing to stop" if a.all or not a.profile else f"'{a.profile}' is not running")
     for r in targets:
         server.stop(r)
-        console.print(f"[good]✔ stopped[/] [accent]{r.name}[/] (pid {r.pid})")
+        console.print(f"[good]✔ stopped[/] [accent]{display_name(r.name)}[/] (pid {r.pid})")
 
 
 def cmd_demo(a: argparse.Namespace) -> None:
@@ -328,7 +588,9 @@ def cmd_demo(a: argparse.Namespace) -> None:
 def cmd_config(a: argparse.Namespace) -> None:
     if a.action == "set":
         if not hasattr(cfg, a.key):
-            die(f"unknown key {a.key} (llama_server, models_dir, theme, hf_token)")
+            die(f"unknown key {a.key} (llama_server, models_dir, hf_cache, download_backend, theme, hf_token)")
+        if a.key == "download_backend" and a.value not in hub.BACKENDS:
+            die(f"download_backend must be one of {', '.join(hub.BACKENDS)}")
         setattr(cfg, a.key, a.value)
         cfg.save()
     t = Table.grid(padding=(0, 2))
@@ -337,7 +599,10 @@ def cmd_config(a: argparse.Namespace) -> None:
     t.add_row("home", str(home()))
     t.add_row("config", str(config_path()))
     t.add_row("llama_server", f"{cfg.llama_server or '(PATH)'}  →  {cfg.server_binary() or '[bad]not found[/]'}")
+    t.add_row("hf_cache", f"{hfcache.cache_dir(cfg)}  [dim]({'set' if cfg.hf_cache else 'same lookup as llama.cpp'})[/]")
     t.add_row("models_dir", str(cfg.models_path()))
+    xet = "hf_xet installed" if hub.xet_available() else "hf_xet not installed → http"
+    t.add_row("download_backend", f"{cfg.download_backend}  [dim]({', '.join(hub.BACKENDS)} · {xet})[/]")
     t.add_row("theme", f"{cfg.theme}  [dim]({', '.join(th.ORDER)})[/]")
     t.add_row("hf_token", "set" if cfg.hf_token else ("HF_TOKEN env" if os.environ.get("HF_TOKEN") else "—"))
     console.print(Panel(t, title="[accent] config [/]", title_align="left", border_style="dim", box=box.ROUNDED))
@@ -347,20 +612,41 @@ def cmd_config(a: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="inari", description="Golden TUI wrapper for llama.cpp's llama-server")
     ap.add_argument("-V", "--version", action="version", version=f"inari {__version__}")
+    ap.add_argument("--nologo", action="store_true", help="show the logo as plain ASCII text")
     sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("setup", aliases=["onboard", "wizard"],
+                       help="guided setup: llama-server → model → context / GPU / chat → all args → profile")
+    s.add_argument("profile", nargs="?", help="profile to edit (or the name for a new one)")
+    s.add_argument("-a", "--advanced", action="store_true", help="open the all-settings table directly")
+    s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("import", help="turn an existing llama-server command into a profile (downloads -hf models)")
+    s.add_argument("command", nargs=argparse.REMAINDER,
+                   help='the command, quoted or as-is: inari import llama-server -hf unsloth/Qwen3-8B-GGUF -c 32768 '
+                        '(omit to paste it, or pipe it in)')
+    s.add_argument("-f", "--file", help="read the command from a script (.sh / .bat / .ps1)")
+    s.add_argument("-p", "--profile", help="profile name (default: from the model file)")
+    s.add_argument("-y", "--yes", action="store_true", help="download without asking and save without the wizard")
+    s.add_argument("--via", choices=hub.BACKENDS, help="download backend (default: config download_backend)")
+    s.set_defaults(fn=cmd_import)
 
     s = sub.add_parser("pull", help="download a GGUF from Hugging Face (repo or repo:QUANT)")
     s.add_argument("repo", nargs="?", help="e.g. unsloth/Qwen3-8B-GGUF or unsloth/Qwen3-8B-GGUF:Q4_K_M "
                    "(omit to browse in the hub TUI)")
     s.add_argument("-p", "--profile", help="create a launch profile with this name")
     s.add_argument("-y", "--yes", action="store_true", help="no prompts (also downloads mmproj)")
+    s.add_argument("--via", choices=hub.BACKENDS, help="download backend (default: config download_backend)")
     s.set_defaults(fn=cmd_pull)
 
     s = sub.add_parser("hub", aliases=["search", "browse"], help="search Hugging Face and download GGUFs in a TUI")
     s.add_argument("query", nargs="*", help="initial search, e.g. qwen3 8b")
     s.set_defaults(fn=cmd_hub)
 
-    s = sub.add_parser("models", aliases=["ls"], help="list downloaded models")
+    s = sub.add_parser("models", aliases=["ls"], help="list local models (HF cache + models_dir)")
+    s.add_argument("action", nargs="?", choices=["list", "migrate"],
+                   help="migrate: move old inari downloads into the HF cache and update profiles")
+    s.add_argument("-y", "--yes", action="store_true")
     s.set_defaults(fn=cmd_models)
 
     s = sub.add_parser("profile", aliases=["p"], help="manage launch profiles")
@@ -388,9 +674,15 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("-y", "--yes", action="store_true")
     s.set_defaults(fn=cmd_profile)
 
-    s = sub.add_parser("serve", aliases=["run"], help="start llama-server from a profile and open the monitor")
-    s.add_argument("profile")
-    s.add_argument("--port", type=int)
+    s = sub.add_parser("serve", aliases=["run"],
+                       help="start llama-server and open the monitor (no profile: router mode, all profiles)")
+    s.add_argument("profile", nargs="?",
+                   help="profile to serve on its own; omit to start llama-server's router with every profile")
+    s.add_argument("--port", type=int, help="listen port (router default: 8080)")
+    s.add_argument("--host", help="router: listen address (default 127.0.0.1)")
+    s.add_argument("-l", "--load", action="append", metavar="PROFILE", help="router: load this model at startup")
+    s.add_argument("--models-max", type=int, metavar="N",
+                   help="router: max models loaded at once (llama.cpp default 4, 0 = unlimited)")
     s.add_argument("--no-tui", action="store_true", help="start in background and return")
     s.set_defaults(fn=cmd_serve)
 
@@ -403,7 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_ps)
 
     s = sub.add_parser("stop", help="stop a server started by inari")
-    s.add_argument("profile", nargs="?")
+    s.add_argument("profile", nargs="?", help="profile name, or `router`")
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_stop)
 
@@ -434,17 +726,96 @@ def main(argv: list[str] | None = None) -> None:
             a.pairs += unknown
         else:
             ap.error(f"unrecognized arguments: {' '.join(unknown)}")
+    if a.nologo:
+        from inari import inari_logo
+
+        inari_logo.ascii_only = True
     if not getattr(a, "fn", None):
-        console.print(BANNER.format(v=__version__))
-        console.print()
-        for c, d in (("hub [QUERY]", "search Hugging Face + download (TUI)"),
-                     ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
-                     ("profile new|set|show|ls", "save llama-server arguments"), ("serve PROFILE", "launch + monitor"),
-                     ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
-                     ("demo", "try the monitor with a simulated server"), ("config", "settings")):
-            console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return main_menu()
+        print_help()
         return
     try:
         a.fn(a)
     except KeyboardInterrupt:
         console.print("[dim]interrupted[/]")
+
+
+# ───────────────────────── main menu (bare `inari`) ─────────────────────────
+def main_menu() -> None:
+    from inari.menu import Menu
+
+    select, flash = "", ""
+    while True:
+        try:
+            action, name = Menu(cfg, console, select=select, flash=flash).run()
+        except KeyboardInterrupt:
+            return
+        select, flash = name, ""
+        if action == "quit":
+            return
+        try:
+            if action == "serve":
+                cmd_serve(argparse.Namespace(profile=name, port=None, no_tui=False))
+            elif action == "router":
+                cmd_serve(argparse.Namespace(profile=None, port=None, no_tui=False))
+            elif action in ("new", "edit"):
+                from inari.wizard import run_wizard
+
+                res = run_wizard(cfg, console, name=name)
+                if res is None:
+                    flash = "setup cancelled — nothing saved"
+                else:
+                    select, flash = res.name, f"✔ profile {res.name} saved"
+                    if res.serve:
+                        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+            elif action == "import":
+                text = read_command_interactive()
+                res = import_command(text) if text.strip() else None
+                if res is None:
+                    flash = "import cancelled — nothing saved"
+                else:
+                    select, flash = res.name, f"✔ profile {res.name} imported"
+                    if res.serve:
+                        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+            elif action == "stop":
+                run = server.find_run(name)
+                if run:
+                    with console.status(f"[accent]Stopping {name}…[/]"):
+                        server.stop(run)
+                    flash = f"✔ stopped {name}"
+            elif action == "hub":
+                app = cmd_hub(argparse.Namespace(query=[]))
+                done = [j for j in app.dl.jobs if j.status == "done"]
+                made = [j.profile for j in done if j.profile]
+                if made:
+                    select, flash = made[-1], f"✔ downloaded — profile {made[-1]} created"
+                elif done:
+                    flash = f"✔ downloaded {len(done)} model(s) — n to set up a profile for it"
+            elif action == "demo":
+                cmd_demo(argparse.Namespace())
+        except KeyboardInterrupt:
+            pass
+        except SystemExit:  # die() — the error is already printed above
+            try:
+                console.input("[dim]Enter to return to the menu[/] ")
+            except (KeyboardInterrupt, EOFError):
+                return
+
+
+def print_help() -> None:
+    from inari.inari_logo import banner
+
+    console.print(banner(th.get(cfg.theme), console))
+    console.print()
+    for c, d in (("", "main menu: pick a profile to serve, or set one up"),
+                 ("setup [PROFILE]", "guided setup wizard (start here)"),
+                 ("import [COMMAND]", "llama-server command → profile (+ model download)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
+                 ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
+                 ("profile new|set|show|ls", "save llama-server arguments"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
+                 ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
+                 ("demo", "try the monitor with a simulated server"), ("config", "settings")):
+        console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")
+    if not list_profiles():
+        console.print()
+        console.print("  [accent2]No profiles yet — run[/] [accent]inari setup[/] [accent2]to make one.[/]")

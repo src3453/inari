@@ -57,6 +57,7 @@ class Request:
     duration: float = 0.0
     status: str = "Reading"
     pp_progress: float = 0.0
+    model: str = ""  # router mode: which model instance served it
     _reuse_seen: bool = field(default=False, repr=False)
 
 
@@ -97,6 +98,7 @@ class LogParser:
         self.live = False  # False while replaying backlog -> no wall-clock timestamps
         self.t0: float | None = None  # wall-clock start of the server, maps relative log timestamps
         self._now: float | None = None
+        self.tag = ""  # copied into Request.model
 
     def _stamp(self) -> float | None:
         if self._now is not None:
@@ -154,7 +156,7 @@ class LogParser:
             req = self._by_task.get(task)
             new_prompt = RE_NEW_PROMPT.search(line)
             if req is None and (new_prompt or "processing task" in line):
-                req = Request(task=task, slot=slot, started=self._stamp())
+                req = Request(task=task, slot=slot, started=self._stamp(), model=self.tag)
                 self._by_task[task] = req
                 self.requests.append(req)
                 if len(self._by_task) > 200:

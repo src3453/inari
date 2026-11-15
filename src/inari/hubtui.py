@@ -15,11 +15,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from inari import hub
+from inari import fit, hfcache, hub
 from inari import theme as th
 from inari.config import Config
 from inari.keys import KeyReader
 from inari.profiles import NAME_RE, Profile, new_profile
+from inari.themepick import ThemePicker
 from inari.tui import Bar, dur, k
 
 
@@ -52,12 +53,14 @@ def window(sel: int, n: int, rows: int) -> tuple[int, int]:
 
 
 class HubApp:
-    def __init__(self, cfg: Config, console: Console, *, query: str = "", theme_name: str = "inari") -> None:
+    def __init__(self, cfg: Config, console: Console, *, query: str = "", theme_name: str = "kitsune") -> None:
         self.cfg = cfg
         self.console = console
         self.theme_name = theme_name
         self.p = th.get(theme_name)
+        self.picker = ThemePicker()
         self.dl = hub.Downloader(cfg)
+        self.spec = fit.spec(cfg.server_binary())
 
         self.screen = "search"  # search | files
         self.focus = "main"  # main | downloads
@@ -128,7 +131,16 @@ class HubApp:
 
         self._bg(work)
 
+    def recommended(self) -> int | None:
+        if not self.repo:
+            return None
+        proj = self.projector() if self.with_mmproj else None
+        return fit.recommend(self.groups, self.spec, self.repo.params, proj.size if proj else 0)
+
     def _default_pick(self) -> int:
+        rec = self.recommended()
+        if rec is not None:
+            return rec
         for pref in ("Q4_K_M", "Q4_K_XL", "Q4_0", "Q5_K_M"):
             for i, g in enumerate(self.groups):
                 if g.quant.endswith(pref):
@@ -172,6 +184,12 @@ class HubApp:
                     j.cancel()
                 return True
             return False
+        if self.picker.active:
+            if self.picker.handle(key) == "pick":
+                self.theme_name = self.picker.name
+                self.say(f"theme: {self.theme_name}")
+            self.p = th.get(self.picker.name)
+            return False
         if self.naming is not None:
             return self.key_naming(key)
         if self.editing:
@@ -183,8 +201,16 @@ class HubApp:
                 return False
             return True
         if key == "t":
-            self.theme_name = th.next_name(self.theme_name)
-            self.p = th.get(self.theme_name)
+            self.picker.open(self.theme_name)
+            return False
+        if key == "v":
+            order = hub.BACKENDS
+            self.dl.backend = order[(order.index(self.dl.backend) + 1) % len(order)]
+            note = {"auto": "xet when available, http to resume partials", "xet": "hf_xet",
+                    "http": "plain HTTP, resumable"}[self.dl.backend]
+            if self.dl.backend == "xet" and not hub.xet_available():
+                note = "hf_xet is not installed — downloads will fail"
+            self.say(f"new downloads via {self.dl.backend} ({note})")
             return False
         if key == "tab":
             if self.dl.jobs:
@@ -302,7 +328,7 @@ class HubApp:
         if key in ("x", "delete"):
             if job.active:
                 job.cancel()
-                self.say(f"cancelling {job.group.name} (partial file kept for resume)")
+                self.say(f"cancelling {job.group.name} (http partials resume next time; xet restarts)")
         elif key in ("p", "enter"):
             if job.status != "done":
                 self.say("the download hasn't finished yet")
@@ -319,13 +345,9 @@ class HubApp:
 
     def make_profile(self, job: hub.Job, name: str) -> None:
         assert job.path is not None
-        try:
-            model = str(job.path.resolve().relative_to(self.cfg.models_path().resolve())).replace("\\", "/")
-        except ValueError:
-            model = str(job.path)
-        prof = new_profile(name, model=model, description=f"from {job.repo}")
+        prof = new_profile(name, model=hub.model_ref(self.cfg, job.path), description=f"from {job.repo}")
         if job.mmproj_path:
-            prof.args["mmproj"] = str(job.mmproj_path)
+            prof.args["mmproj"] = hub.model_ref(self.cfg, job.mmproj_path)
         prof.save()
         job.profile = name
         self.say(f"✔ profile '{name}' saved — run it with: inari serve {name}")
@@ -338,7 +360,8 @@ class HubApp:
         parts = [
             Layout(self.header(), size=2),
             Layout(Text("─" * w, style=self.p.dim), size=1),
-            Layout(self.view_search(body_h) if self.screen == "search" else self.view_files(body_h), size=body_h),
+            Layout(self.picker.render(self.p) if self.picker.active else
+                   self.view_search(body_h) if self.screen == "search" else self.view_files(body_h), size=body_h),
         ]
         if jobs_h:
             parts.append(Layout(self.view_downloads(jobs_h), size=jobs_h))
@@ -473,8 +496,22 @@ class HubApp:
             mm.append("[x] " if self.with_mmproj else "[ ] ", style=f"bold {p.accent}")
             mm.append(f"{proj.name}  {hub.human(proj.size)}", style=p.text if self.with_mmproj else p.dim)
             mm.append("   m toggle", style=p.dim)
-        top = self.panel(Group(info, mm) if proj else info, hit.id, focused=False, height=4 if proj else 3)
-        top_h = 4 if proj else 3
+        extra = proj.size if proj and self.with_mmproj else 0
+        rec = self.recommended()
+        pc = Text()
+        pc.append("this PC ", style=p.dim)
+        pc.append(self.spec.describe(), style=f"bold {p.text}")
+        if self.groups:
+            sel = self.groups[self.fsel]
+            f = fit.judge(sel.size + extra, self.spec)
+            pc.append("   ")
+            pc.append(f"{sel.quant}: ", style=f"bold {p.accent2}")
+            pc.append(f.note, style=self._fit_style(f.level))
+            if rec is not None and rec != self.fsel:
+                pc.append(f"   ★ {self.groups[rec].quant} recommended", style=p.accent)
+        lines = [info] + ([mm] if proj else []) + [pc]
+        top_h = len(lines) + 2
+        top = self.panel(Group(*lines), hit.id, focused=False, height=top_h)
 
         rows = max(height - top_h - 4, 1)
         if self.error:
@@ -489,6 +526,7 @@ class HubApp:
                       padding=(0, 1), show_edge=False)
             t.add_column("", width=1, no_wrap=True)
             t.add_column("QUANT", no_wrap=True)
+            t.add_column("FIT", no_wrap=True)
             t.add_column("FILE", ratio=3, no_wrap=True, overflow="ellipsis")
             t.add_column("SIZE", justify="right", no_wrap=True)
             t.add_column("", ratio=1, min_width=6, no_wrap=True)
@@ -503,16 +541,23 @@ class HubApp:
                 local = Text("✔ on disk", style=p.good) if state == "done" else \
                     Text("↓ queued", style=p.accent) if queued else \
                     Text("◐ partial", style=p.warn) if state == "partial" else Text("")
-                t.add_row(Text("▸" if on else " ", style=p.accent),
-                          Text(g.quant, style=f"bold {p.accent2}" if on else p.accent2),
+                q = Text(g.quant, style=f"bold {p.accent2}" if on else p.accent2)
+                if i == rec:
+                    q.append(" ★", style=f"bold {p.accent}")
+                f = fit.judge(g.size + extra, self.spec)
+                t.add_row(Text("▸" if on else " ", style=p.accent), q, Text(f.label, style=self._fit_style(f.level)),
                           Text(g.name, style=f"bold {p.text}" if on else p.text),
                           hub.human(g.size), Bar(g.size / biggest, p.accent if on else p.dim, p.track),
                           str(len(g.files)) if len(g.files) > 1 else "", local,
                           style=f"on {p.track}" if on and focused else "")
             body = t
-        sub = f" {len(self.groups)} files · → {hub.local_dir_for(hit.id, self.cfg)} "
+        sub = f" {len(self.groups)} files · → {hfcache.repo_dir(self.cfg, hit.id)} "
         files = self.panel(body, "Files", focused=focused, height=height - top_h, subtitle=sub)
         return Group(top, files)
+
+    def _fit_style(self, level: str) -> str:
+        p = self.p
+        return {"gpu": p.good, "split": p.accent2, "cpu": p.warn, "tight": p.warn, "no": p.bad}.get(level, p.dim)
 
     def view_downloads(self, height: int) -> RenderableType:
         p = self.p
@@ -536,9 +581,11 @@ class HubApp:
             name.append(j.group.name, style=f"bold {p.text}" if on else p.text)
             if j.mmproj:
                 name.append(" +mmproj", style=p.info)
-            if j.status == "downloading" and j.speed:
+            if j.status == "downloading" and j.via == "waiting":
+                note = Text("waiting — another process is downloading this file", style=p.warn)
+            elif j.status == "downloading" and j.speed:
                 eta = (j.total - j.done) / j.speed
-                note = Text(f"{hub.human(j.speed)}/s · {dur(eta)} left", style=p.accent2)
+                note = Text(f"{hub.human(j.speed)}/s · {dur(eta)} left · {j.via or j.backend}", style=p.accent2)
             elif j.status == "done":
                 note = Text(f"profile: {j.profile}" if j.profile else "p → make profile",
                             style=p.good if j.profile else p.accent2)
@@ -571,8 +618,8 @@ class HubApp:
             items = [("↑↓", "select"), ("Enter", "open"), ("/", "search"), ("o", "sort"), ("b", "browser"),
                      ("t", "theme"), ("q", "quit")]
         else:
-            items = [("↑↓", "select"), ("Enter", "download"), ("m", "mmproj"), ("Esc", "back"), ("b", "browser"),
-                     ("q", "quit")]
+            items = [("↑↓", "select"), ("Enter", "download"), ("m", "mmproj"), ("v", f"via {self.dl.backend}"),
+                     ("Esc", "back"), ("b", "browser"), ("q", "quit")]
         if self.dl.jobs and self.focus == "main" and not self.editing:
             items.insert(-1, ("Tab", "downloads"))
         t = Text()
@@ -588,7 +635,8 @@ class HubApp:
             t.append(self.flash[0], style=f"bold {p.accent2}")
             return t
         t.append("Hub", style=f"bold {p.accent}")
-        t.append(f"   |   models → {self.cfg.models_path()}", style=p.text)
+        t.append(f"   |   cache → {hfcache.cache_dir(self.cfg)}", style=p.text)
+        t.append(f"   |   via {self.dl.backend}", style=p.text)
         t.append("   |   token " + ("set" if hub._token(self.cfg) else "none (public repos only)"), style=p.text)
         if self.hits and self.screen == "search":
             t.append(f"   |   {len(self.hits)} repos", style=p.text)

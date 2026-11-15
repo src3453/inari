@@ -8,9 +8,9 @@ import sys
 import threading
 
 _WIN_SPECIAL = {"H": "up", "P": "down", "K": "left", "M": "right", "I": "pgup", "Q": "pgdn",
-                "G": "home", "O": "end"}
+                "G": "home", "O": "end", "S": "delete"}
 _ANSI = {"[A": "up", "[B": "down", "[C": "right", "[D": "left", "[5~": "pgup", "[6~": "pgdn",
-         "[H": "home", "[F": "end"}
+         "[H": "home", "[F": "end", "[3~": "delete"}
 
 
 def _name(ch: str) -> str:

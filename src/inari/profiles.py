@@ -3,7 +3,7 @@
 A profile is a TOML file in ``~/.inari/profiles/<name>.toml``::
 
     description = "Qwen3 8B, full GPU offload"
-    model = "unsloth__Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"   # relative to models dir, or absolute
+    model = "hf://unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"   # HF cache ref, path relative to models dir, or absolute
     host = "127.0.0.1"
     port = 8080
     server_bin = ""          # optional per-profile llama-server override
@@ -30,6 +30,7 @@ from typing import Any
 
 import tomli_w
 
+from inari import hfcache
 from inari.config import Config, profiles_dir
 
 TOP_LEVEL = ("description", "model", "host", "port", "server_bin")
@@ -132,6 +133,9 @@ class Profile:
     def model_path(self, cfg: Config) -> Path | None:
         if not self.model:
             return None
+        parsed = hfcache.parse_ref(self.model)
+        if parsed:  # unresolved -> a path that doesn't exist, so callers report it missing
+            return hfcache.resolve(cfg, self.model) or hfcache.repo_dir(cfg, parsed[0]) / parsed[1]
         p = Path(self.model).expanduser()
         if not p.is_absolute():
             p = cfg.models_path() / p
@@ -154,7 +158,7 @@ class Profile:
             cmd += ["--model", str(mp)]
         cmd += ["--host", self.host, "--port", str(self.port)]
         for key, value in self.args.items():
-            cmd += render_arg(key, value)
+            cmd += render_arg(key, _resolve_refs(value, cfg))
         cmd += self.extra
         if "--metrics" not in cmd:
             cmd.append("--metrics")  # the monitor reads /metrics
@@ -162,6 +166,16 @@ class Profile:
             # recent builds hide device / buffer / per-request lines below verbosity 4
             cmd += ["-lv", "4"]
         return cmd
+
+
+def _resolve_refs(value: Any, cfg: Config) -> Any:
+    """``hf://owner/repo/file`` values (e.g. mmproj) -> local paths in the HF cache."""
+    if isinstance(value, list):
+        return [_resolve_refs(v, cfg) for v in value]
+    if isinstance(value, str) and value.startswith(hfcache.REF_PREFIX):
+        p = hfcache.resolve(cfg, value)
+        return str(p) if p else value
+    return value
 
 
 def normalize_key(key: str) -> str:

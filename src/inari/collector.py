@@ -8,17 +8,19 @@ tails its log file and samples host hardware, producing immutable-ish
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from inari.hw import HwSampler, HwStat
-from inari.logparse import LogInfo, LogParser, Request
+from inari.logparse import RE_PREFIX, LogInfo, LogParser, Request
 
 HIST = 120
 
@@ -58,6 +60,11 @@ class Snapshot:
     cmd: list[str] = field(default_factory=list)
     health: str = ""
     has_logs: bool = False
+    # router mode
+    router: bool = False
+    models: list[dict] = field(default_factory=list)  # {"id", "status", "source"}
+    focus: str = ""  # model whose slots / metrics / log the views show
+    follow: bool = True  # focus follows the busy / most recently loaded model
 
 
 def parse_metrics(text: str) -> dict[str, float]:
@@ -113,6 +120,7 @@ class Collector:
         self._gpu_hist: deque[float] = deque(maxlen=HIST)
         self._last_poll = time.monotonic()
         self._props_at = 0.0
+        self.q = ""  # query string for per-model endpoints (router mode: ?model=...)
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     # ---------- lifecycle ----------
@@ -166,8 +174,12 @@ class Collector:
         s.cpu_hist = list(self._cpu_hist)
         s.disk_hist = list(self._disk_hist)
         s.gpu_hist = list(self._gpu_hist)
+        self._finish(s)
         with self._lock:
             self.snap = s
+
+    def _finish(self, s: Snapshot) -> None:
+        """Last touch on a snapshot before it is published (subclass hook)."""
 
     def _process_state(self, s: Snapshot) -> None:
         if self.popen is not None:
@@ -205,7 +217,7 @@ class Collector:
         s.health = "ok" if r.status_code == 200 else f"HTTP {r.status_code}"
 
         if not s.props or time.monotonic() - self._props_at > 10:
-            pr = self._get("/props")
+            pr = self._get("/props" + self.q)
             if pr is not None and pr.status_code == 200:
                 s.props = pr.json()
                 self._props_at = time.monotonic()
@@ -215,11 +227,11 @@ class Collector:
         if mp:
             s.model = Path(mp).stem if not s.model or s.model == self.parser.info.model_name else s.model
 
-        mr = self._get("/metrics")
+        mr = self._get("/metrics" + self.q)
         if mr is not None and mr.status_code == 200:
             s.metrics = parse_metrics(mr.text)
 
-        sr = self._get("/slots")
+        sr = self._get("/slots" + self.q)
         s.slots = sr.json() if sr is not None and sr.status_code == 200 and isinstance(sr.json(), list) else []
 
         self._derive(s, dt)
@@ -355,4 +367,216 @@ class Collector:
         data = self._log_buf + data
         *lines, self._log_buf = data.split(b"\n")
         for raw in lines:
-            self.parser.feed(raw.decode("utf-8", errors="replace"))
+            self._feed(raw.decode("utf-8", errors="replace"))
+
+    def _feed(self, line: str) -> None:
+        self.parser.feed(line)
+
+
+# ───────────────────────── router mode ─────────────────────────
+RE_CHILD = re.compile(r"^\[(\d+)\] ?(.*)$")
+RE_SPAWN = re.compile(r"spawning server instance with name=(.+?) on port (\d+)")
+
+
+def _rel_seconds(line: str) -> float | None:
+    m = RE_PREFIX.match(line)
+    if not m:
+        return None
+    mins, sec, ms, us = (int(x) for x in m.group(1, 2, 3, 4))
+    return mins * 60 + sec + ms / 1e3 + us / 1e6
+
+
+class RouterCollector(Collector):
+    """Monitors a llama-server in router mode.
+
+    The router's own /health and /models are polled; slots, metrics and props come from one model
+    at a time (``focus``), which by default follows whichever model is busy or was loaded last.
+    Child instances log through the router as ``[port] ...``; each model gets its own LogParser.
+    """
+
+    def __init__(self, url: str, **kw: Any) -> None:
+        self.parsers: dict[str, LogParser] = {}
+        self.port_names: dict[str, str] = {}
+        self.spawn_order: list[str] = []
+        self.all_lines: deque[str] = deque(maxlen=3000)
+        self.models: list[dict] = []
+        self.focus = ""
+        self.follow = True
+        self._live = False
+        self._hw_for = None
+        super().__init__(url, **kw)
+        self.router_parser = self.parser
+        self.q = ""
+        self.snap.router = True
+
+    # ---------- controls (called from the UI thread) ----------
+    def set_focus(self, model: str) -> None:
+        self.follow = False
+        self._switch(model)
+        self.poke()
+
+    def follow_auto(self) -> None:
+        self.follow = True
+        self.poke()
+
+    # ---------- logs ----------
+    def start(self) -> "RouterCollector":
+        super().start()
+        self._live = True
+        for p in self.parsers.values():
+            p.live = True
+        return self
+
+    def _parser_for(self, name: str) -> LogParser:
+        p = self.parsers.get(name)
+        if p is None:
+            p = LogParser()
+            p.tag = name
+            p.live = self._live
+            self.parsers[name] = p
+        return p
+
+    def _feed(self, line: str) -> None:
+        m = RE_CHILD.match(line)
+        if m:
+            port, rest = m.group(1), m.group(2)
+            name = self.port_names.get(port, port)
+            self._parser_for(name).feed(rest)
+            self.all_lines.append(f"[{name}] {rest}")
+            return
+        self.router_parser.feed(line)
+        self.all_lines.append(line)
+        sp = RE_SPAWN.search(line)
+        if sp:
+            name, port = sp.group(1), sp.group(2)
+            self.port_names[port] = name
+            p = self._parser_for(name)
+            p.info, p._by_task = LogInfo(), {}  # fresh instance; keep the request history
+            rel = _rel_seconds(line)
+            t0 = self.router_parser.t0
+            p.t0 = t0 + rel if t0 is not None and rel is not None else None
+            if name in self.spawn_order:
+                self.spawn_order.remove(name)
+            self.spawn_order.append(name)
+
+    # ---------- focus ----------
+    def _status(self, name: str) -> str:
+        from inari.router import status_of
+
+        return next((status_of(m) for m in self.models if m.get("id") == name), "")
+
+    def _switch(self, name: str) -> None:
+        if name == self.focus:
+            return
+        self.focus = name
+        self.parser = self._parser_for(name) if name else self.router_parser
+        self.q = f"?model={quote(name, safe='')}&autoload=false" if name else ""
+        self._prev_decoded = {}
+        self._props_at = 0.0
+        with self._lock:
+            self.snap.props, self.snap.model, self.snap.n_ctx = {}, "", 0
+        self._hw_for = None
+
+    def _pick(self) -> None:
+        if not self.follow:
+            return
+        loaded = [m["id"] for m in self.models if self._status(m["id"]) == "loaded"]
+        loading = [m["id"] for m in self.models if self._status(m["id"]) == "loading"]
+
+        def recent(names: list[str]) -> str:
+            ranked = sorted(names, key=lambda n: self.spawn_order.index(n) if n in self.spawn_order else -1)
+            return ranked[-1] if ranked else ""
+
+        if self.focus not in loaded + loading:
+            self._switch(recent(loading) or recent(loaded))
+            return
+        if self.snap.state == "Idle":  # jump to another model that is serving a request
+            for name in loaded:
+                if name == self.focus:
+                    continue
+                r = self._get(f"/slots?model={quote(name, safe='')}&autoload=false")
+                try:
+                    slots = r.json() if r is not None and r.status_code == 200 else []
+                except ValueError:
+                    slots = []
+                if isinstance(slots, list) and any(isinstance(x, dict) and x.get("is_processing") for x in slots):
+                    self._switch(name)
+                    return
+
+    def _track_process(self) -> None:
+        """Point the hardware sampler's process stats at the focused model's llama-server."""
+        if self._hw_for == self.focus or not self.pid:
+            return
+        import psutil
+
+        target = None
+        try:
+            if self.focus:
+                for c in psutil.Process(self.pid).children():
+                    cmd = c.cmdline()
+                    if "--alias" in cmd and cmd[cmd.index("--alias") + 1:cmd.index("--alias") + 2] == [self.focus]:
+                        target = c
+                        break
+            else:
+                target = psutil.Process(self.pid)
+            if target is None:
+                return
+            target.cpu_percent(None)
+        except (psutil.Error, ValueError):
+            return
+        self.hw._proc = target
+        self._hw_for = self.focus
+
+    # ---------- poll ----------
+    def tick(self) -> None:
+        from inari.router import models as fetch_models
+
+        try:
+            self.models = fetch_models(self.client, self.url)
+        except (httpx.HTTPError, ValueError):
+            self.models = []
+        self._tail()
+        self._pick()
+        self._track_process()
+        super().tick()
+
+    def _poll_server(self, s: Snapshot, dt: float) -> None:
+        st = self._status(self.focus) if self.focus else ""
+        if st == "loaded":
+            super()._poll_server(s, dt)
+            return
+        r = self._get("/health")
+        s.slots, s.metrics, s.progress, s.progress_text = [], {}, 0.0, ""
+        self._push_speed(0.0)
+        if r is None:
+            s.health = "unreachable"
+            if not s.alive:
+                s.state = "Error"
+                s.detail = f"Router exited (code {s.exit_code})" if s.exit_code is not None else "Router exited"
+            elif not self.models and self.pid:
+                s.state, s.detail = "Loading", "Starting router"
+            else:
+                s.state, s.detail = "Error", "Unreachable"
+            return
+        s.health = "ok" if r.status_code == 200 else f"HTTP {r.status_code}"
+        if st == "loading":
+            s.state, s.detail = "Loading", f"Loading {self.focus}"
+        elif self.focus:
+            s.state, s.detail = "Idle", f"{self.focus} not loaded — 8 Models, Enter to load"
+        else:
+            s.state, s.detail = "Idle", "Router ready — no model loaded"
+
+    def _finish(self, s: Snapshot) -> None:
+        from inari.router import status_of
+
+        s.router, s.focus, s.follow = True, self.focus, self.follow
+        s.models = [{"id": m.get("id", ""), "status": status_of(m), "source": m.get("source", "")}
+                    for m in self.models]
+        if self.focus:
+            s.model = self.focus
+        else:
+            s.model, s.n_ctx = "", 0
+        reqs = [r for p in self.parsers.values() for r in p.requests]
+        reqs.sort(key=lambda r: r.started or 0.0)
+        s.requests = reqs[-500:]
+        s.logs = list(self.all_lines)

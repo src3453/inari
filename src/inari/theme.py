@@ -1,4 +1,4 @@
-"""Yellow-based colour themes (cycle with `t` in the monitor)."""
+"""Colour themes (cycle with `t` in the monitor). kitsune is the default; washi is for light terminals."""
 
 from __future__ import annotations
 
@@ -20,24 +20,34 @@ class Palette:
     warn: str
     bad: str
     info: str
+    desc: str = ""  # one-line description for the theme picker
+    bg: str = "#16161a"  # the terminal background this theme is made for (picker preview only)
 
 
 PALETTES: dict[str, Palette] = {
-    "inari": Palette("inari", "#ffc21a", "#ffe27a", "#f3ead2", "#9c8b5e", "#3b3420",
-                     "#ffd84d", "#ff9f1c", "#ff5f56", "#e8c872"),
-    "amber": Palette("amber", "#ffa600", "#ffcc66", "#f6e7cf", "#9a7a48", "#3d2f17",
-                     "#ffbf3c", "#ff7b29", "#ff4d4d", "#e0b070"),
-    "lemon": Palette("lemon", "#f5e400", "#fff67a", "#f2f2dc", "#8f8a55", "#34321c",
-                     "#e3f53b", "#ffb21c", "#ff5f56", "#d8d27a"),
     "kitsune": Palette("kitsune", "#ffb000", "#ff6b35", "#fbe9d7", "#a07a5a", "#3a2a1e",
-                       "#ffcf40", "#ff6b35", "#ff3b3b", "#f0a868"),
+                       "#ffcf40", "#ff6b35", "#ff3b3b", "#f0a868",
+                       desc="golden fox — warm amber and vermilion (default)"),
+    "sora": Palette("sora", "#4fc3f7", "#9be7ff", "#e3f2fd", "#6b8aa3", "#1c2e3d",
+                    "#69f0ae", "#ffb74d", "#ff5f56", "#81d4fa",
+                    desc="sky — cool light blue"),
+    "matcha": Palette("matcha", "#7ed957", "#c5f29b", "#e8f5e0", "#7a9a6a", "#1f3020",
+                      "#b8f36b", "#ffc857", "#ff5f56", "#7fdbca",
+                      desc="green tea — fresh greens"),
+    "sumi": Palette("sumi", "#ffffff", "#cfcfcf", "#c8c8c8", "#7a7a7a", "#303030",
+                    "#ececec", "#a8a8a8", "#ff5f56", "#b8b8b8",
+                    desc="ink — greyscale, red only for errors"),
+    "washi": Palette("washi", "#d9480f", "#b35c00", "#2b2b2b", "#8a8174", "#e6dfd3",
+                     "#2f8f46", "#c77700", "#d32f2f", "#1e6fb8",
+                     desc="paper — dark text for light terminal backgrounds", bg="#faf7f0"),
 }
 
+DEFAULT = "kitsune"
 ORDER = list(PALETTES)
 
 
 def get(name: str) -> Palette:
-    return PALETTES.get(name, PALETTES["inari"])
+    return PALETTES.get(name, PALETTES[DEFAULT])
 
 
 def next_name(name: str) -> str:
@@ -69,5 +79,5 @@ def rich_theme(p: Palette) -> RichTheme:
     })
 
 
-def make_console(name: str = "inari") -> Console:
+def make_console(name: str = DEFAULT) -> Console:
     return Console(theme=rich_theme(get(name)), highlight=False)

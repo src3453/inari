@@ -16,6 +16,7 @@ from pathlib import Path
 
 import psutil
 
+from inari import hfcache
 from inari.config import Config, logs_dir, runs_dir
 from inari.profiles import Profile
 
@@ -88,18 +89,29 @@ def launch(profile: Profile, cfg: Config) -> tuple[RunInfo, subprocess.Popen]:
     cmd = profile.build_command(cfg)
     mp = profile.model_path(cfg)
     if mp is not None and not mp.exists() and "-hf" not in profile.args and "hf-repo" not in profile.args:
+        parsed = hfcache.parse_ref(profile.model)
+        if parsed:
+            raise FileNotFoundError(f"{profile.model} is not in the HF cache ({hfcache.cache_dir(cfg)}) — "
+                                    f"run: inari pull {parsed[0]}")
         raise FileNotFoundError(f"model not found: {mp}")
     if port_in_use(profile.host, profile.port):
         raise RuntimeError(f"port {profile.port} is already in use")
+    return spawn(profile.name, cmd, profile.url(), cfg, env=profile.env)
 
+
+def spawn(name: str, cmd: list[str], url: str, cfg: Config, *, env: dict[str, str] | None = None,
+          log_name: str = "") -> tuple[RunInfo, subprocess.Popen]:
+    """Start ``cmd`` detached, logging to ~/.inari/logs, and record it in ~/.inari/runs."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    log_path = logs_dir() / f"{profile.name}-{stamp}.log"
+    log_path = logs_dir() / f"{log_name or name}-{stamp}.log"
     log_f = open(log_path, "wb")
     log_f.write(("$ " + subprocess.list2cmdline(cmd) + "\n").encode())
     log_f.flush()
 
-    env = dict(os.environ)
-    env.update(profile.env)
+    full_env = dict(os.environ)
+    if cfg.hf_cache and "LLAMA_CACHE" not in full_env:
+        full_env["LLAMA_CACHE"] = str(hfcache.cache_dir(cfg))  # so -hf in llama-server shares inari's cache
+    full_env.update(env or {})
     kwargs: dict = {}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
@@ -107,13 +119,13 @@ def launch(profile: Profile, cfg: Config) -> tuple[RunInfo, subprocess.Popen]:
         kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                            env=env, **kwargs)
+                            env=full_env, **kwargs)
     log_f.close()  # child keeps its own handle
     try:
         ct = psutil.Process(proc.pid).create_time()
     except psutil.Error:
         ct = 0.0
-    run = RunInfo(name=profile.name, pid=proc.pid, url=profile.url(), log=str(log_path), cmd=cmd,
+    run = RunInfo(name=name, pid=proc.pid, url=url, log=str(log_path), cmd=cmd,
                   started=time.time(), create_time=ct)
     run.save()
     _prune_logs()
@@ -123,14 +135,23 @@ def launch(profile: Profile, cfg: Config) -> tuple[RunInfo, subprocess.Popen]:
 def stop(run: RunInfo, timeout: float = 8.0) -> bool:
     try:
         p = psutil.Process(run.pid)
-        p.terminate()
-        try:
-            p.wait(timeout)
-        except psutil.TimeoutExpired:
-            p.kill()
-            p.wait(3)
+        # router mode: one llama-server per loaded model. On Windows terminate() is a hard kill, so the
+        # router could not clean them up itself — stop them first.
+        procs = p.children(recursive=True) + [p]
     except psutil.NoSuchProcess:
-        pass
+        procs = []
+    for proc in procs:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=timeout)
+    for proc in alive:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=3)
     run.remove()
     return True
 
