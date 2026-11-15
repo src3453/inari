@@ -640,6 +640,17 @@ def pick_profile_interactive(prompt: str = "Chat with #") -> str:
     return names[int(idx) - 1]
 
 
+def effort_arg(v: str) -> str:
+    """argparse type for ``--effort``: validate now, parse again in cmd_cli (chat is imported lazily)."""
+    from inari.chat import parse_effort
+    try:
+        parse_effort(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid value {v!r}: a token count (e.g. 2048, 8k), low/medium/high/max, off or auto") from None
+    return v
+
+
 def cmd_cli(a: argparse.Namespace) -> None:
     """Chat in the terminal like llama-cli. Uses a server that already serves the profile (on its own or via
     the router); otherwise starts llama-server for the chat and stops it again when you leave."""
@@ -688,6 +699,8 @@ def cmd_cli(a: argparse.Namespace) -> None:
                   # piped one-shot output (`inari cli x -p … > out.txt`) gets the answer only
                   show_reasoning=not getattr(a, "no_think", False) and (prompt is None or sys.stdout.isatty()),
                   markdown=not getattr(a, "plain", False))
+    if getattr(a, "effort", None):
+        c.effort = chat.parse_effort(a.effort)
     ok = True
     try:
         chat.wait_ready(console, url, alive=alive, log=log, label=label)
@@ -860,6 +873,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--temp", type=float, help="temperature for this chat (default: the profile's)")
     s.add_argument("-n", "--n-predict", type=int, metavar="N", help="max tokens per reply")
     s.add_argument("--no-think", action="store_true", help="hide the model's reasoning (/think toggles it)")
+    s.add_argument("-e", "--effort", type=effort_arg, metavar="N|LEVEL",
+                   help="thinking budget: tokens (2048, 8k), low/medium/high/max, off or auto (/effort changes it)")
     s.add_argument("--plain", action="store_true",
                    help="show replies as plain text instead of rendered Markdown (/md toggles it)")
     s.add_argument("--keep", action="store_true",
