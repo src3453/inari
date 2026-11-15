@@ -2,7 +2,24 @@
 
 llama.cpp の `llama-server` を、黄色基調の豪華なモニタリング TUI 付きで扱うラッパー。
 
-![overview](docs/overview.svg)
+![モニタリング TUI（Overview）](docs/monitor.png)
+
+<table>
+  <tr>
+    <td><img src="docs/menu.png" alt="メインメニュー"></td>
+    <td><img src="docs/chat.png" alt="ターミナルチャット"></td>
+  </tr>
+  <tr>
+    <td align="center">メインメニュー</td>
+    <td align="center">ターミナルチャット（<code>inari cli</code>）</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/hub.png" alt="Hub（Hugging Face から GGUF をダウンロード）"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">Hub — 量子化ごとの VRAM 適合を見ながら GGUF をダウンロード</td>
+  </tr>
+</table>
 
 - **HuggingFace から GGUF をダウンロード** — TUI で検索 → 量子化を選んでダウンロード、または `repo:QUANT` 指定。分割 GGUF、mmproj に対応。保存先は llama.cpp の `-hf` と同じ Hugging Face キャッシュで、Xet / HTTP を切り替え可能
 - **起動引数のプロファイル化** — `~/.inari/profiles/*.toml` に保存
