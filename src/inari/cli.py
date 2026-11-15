@@ -945,6 +945,12 @@ def main_menu() -> None:
             elif action == "chat":
                 console.clear()
                 cmd_cli(argparse.Namespace(profile=name))
+            elif action.startswith("tune:"):
+                mode = action.split(":", 1)[1]
+                console.clear()
+                cmd_tune(argparse.Namespace(profile=name, goal="balanced" if mode == "thorough" else mode,
+                                            thorough=mode == "thorough", yes=False))
+                console.input("[dim]Enter to return to the menu[/] ")
             elif action == "router":
                 cmd_serve(argparse.Namespace(profile=None, port=None, no_tui=False))
             elif action in ("new", "edit"):

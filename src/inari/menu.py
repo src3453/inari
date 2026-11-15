@@ -11,9 +11,13 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
+from rich import box
+from rich.align import Align
+from rich.panel import Panel
+
 from inari import server
 from inari import theme as th
-from inari.config import Config
+from inari.config import Config, config_path
 from inari.hubtui import window
 from inari.inari_logo import banner
 from inari.keys import KeyReader
@@ -38,12 +42,60 @@ ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded o
            ("import", "⇲ Import command", "paste a llama-server command line → profile"),
            ("hub", "↓ Hub", "search Hugging Face and download GGUFs"),
            ("demo", "▷ Demo", "try the monitor with a simulated server"),
+           ("settings", "⚙ Settings", "theme, download backend, llama-server path"),
            ("quit", "× Quit", "")]
+TUNE_OPTIONS = [("balanced", "b", "Balanced", "quick · a typical chat request"),
+                ("gen", "g", "Generation", "quick · tokens/s while replying"),
+                ("prompt", "p", "Prompt", "quick · tokens/s reading the prompt"),
+                ("thorough", "t", "Thorough", "balanced · up to 24 runs, ×2 each")]
+
+
+class Settings:
+    """The Settings panel of the main menu. Rows: theme (opens the picker) · download backend · info."""
+
+    ROWS = ("theme", "backend", "server", "config")
+
+    def __init__(self) -> None:
+        self.active = False
+        self.sel = 0
+
+    def render(self, p: th.Palette, cfg: Config) -> RenderableType:
+        from inari.hub import BACKENDS
+
+        t = Table.grid(padding=(0, 2))
+        t.add_column(width=2, no_wrap=True)
+        t.add_column(no_wrap=True, min_width=18)
+        t.add_column(no_wrap=True, overflow="ellipsis")
+        backend = cfg.download_backend if cfg.download_backend in BACKENDS else "auto"
+        rows = [("Theme", cfg.theme, "Enter: choose with a live preview"),
+                ("Download backend", backend, "←→: auto · xet · http (http resumes partials)"),
+                ("llama-server", cfg.server_binary() or "not found", "change it in + Setup & models (step 1)"),
+                ("Config file", str(config_path()), "all settings: inari config show / set")]
+        for i, (label, val, note) in enumerate(rows):
+            on = i == self.sel
+            editable = i < 2
+            v = Text()
+            v.append("‹ " if on and i == 1 else "  " if i == 1 else "", style=p.accent)
+            v.append(val, style=f"bold {p.accent2}" if on and editable else (p.text if editable else p.dim))
+            v.append(" ›" if on and i == 1 else "", style=p.accent)
+            t.add_row(Text("▶" if on else "", style=f"bold {p.accent}"),
+                      Text(label, style=f"bold {p.accent}" if on else p.text), v)
+            t.add_row("", "", Text(note, style=p.dim))
+        hint = Text.assemble(("↑↓", f"bold {p.accent}"), (" choose   ", p.dim), ("Enter", f"bold {p.accent}"),
+                             (" change   ", p.dim), ("Esc", f"bold {p.accent}"), (" back", p.dim))
+        body = Table.grid()
+        body.add_row(t)
+        body.add_row(Text(""))
+        body.add_row(hint)
+        return Align.center(Panel(body, title=Text(" Settings ", style=f"bold {p.accent}"), title_align="left",
+                                  border_style=p.accent, box=box.ROUNDED, padding=(1, 3), width=88),
+                            vertical="middle")
 
 
 class Menu:
     """``run()`` returns ``(action, profile_name)``:
-    serve · chat · edit · stop · new · hub · demo · quit. Deleting a profile happens in place."""
+    serve · chat · tune:<goal|thorough> · edit · stop · new · hub · demo · quit.
+    Deleting a profile and the Settings panel (theme, …) are handled in place."""
 
     last_launch = "serve"  # what Enter on a profile chose last time — focused first in the chooser
 
@@ -54,6 +106,8 @@ class Menu:
         self.picker = ThemePicker()
         self.modal = ConfirmModal()
         self.chooser = ChoiceModal()
+        self.tune_chooser = ChoiceModal()
+        self.settings = Settings()
         self.rows: list[Row] = []
         self.sel = 0
         self.confirm: tuple[str, str, str] | None = None  # (question, action, name)
@@ -122,6 +176,13 @@ class Menu:
                 self.say(f"theme: {self.cfg.theme}")
             self.p = th.get(self.picker.name)
             return None
+        if self.settings.active:
+            return self.key_settings(key)
+        if self.tune_chooser.active:
+            got = self.tune_chooser.handle(key)
+            if got and got != "no":
+                return ("tune:" + got, self.rows[self.sel].name)
+            return None
         if self.modal.active:
             self.modal.handle(key)
             return None
@@ -156,8 +217,8 @@ class Menu:
             return ("import", "")
         if key == "r":
             return ("router", "")
-        if key == "t":
-            self.picker.open(self.cfg.theme)
+        if key == "o":
+            self.open_settings()
             return None
         if key.isdigit() and key != "0":
             i = int(key) - 1
@@ -174,6 +235,9 @@ class Menu:
             return ("edit", row.name)
         if key == "c":
             return self.launch("chat")
+        if key == "t":
+            self.ask_tune(row)
+            return None
         if key in ("d", "delete"):
             self.ask_delete(row)
             return None
@@ -183,6 +247,49 @@ class Menu:
                 return None
             self.confirm = (f"Stop {row.name}?", "stop", row.name)
         return None
+
+    def open_settings(self) -> None:
+        self.settings.active = True
+        self.settings.sel = 0
+
+    def key_settings(self, key: str) -> tuple[str, str] | None:
+        from inari.hub import BACKENDS
+
+        s = self.settings
+        n = len(Settings.ROWS)
+        if key in ("esc", "q", "Q", "o", "b"):
+            s.active = False
+        elif key == "ctrl+c":
+            return ("quit", "")
+        elif key in ("up", "k"):
+            s.sel = (s.sel - 1) % n
+        elif key in ("down", "j", "tab"):
+            s.sel = (s.sel + 1) % n
+        elif Settings.ROWS[s.sel] == "theme" and key in ("enter", " ", "right", "l"):
+            self.picker.open(self.cfg.theme)
+        elif Settings.ROWS[s.sel] == "backend" and key in ("enter", " ", "right", "left", "l", "h"):
+            cur = self.cfg.download_backend if self.cfg.download_backend in BACKENDS else "auto"
+            d = -1 if key in ("left", "h") else 1
+            self.cfg.download_backend = BACKENDS[(BACKENDS.index(cur) + d) % len(BACKENDS)]
+            self.cfg.save()
+            self.say(f"download backend: {self.cfg.download_backend}")
+        return None
+
+    def ask_tune(self, row: Row) -> None:
+        if row.error:
+            self.say(f"can't read {row.name}: {row.error}")
+        elif row.running:
+            self.say(f"{row.name} is serving — stop it first (x) so the GPU memory is free")
+        elif row.missing:
+            self.say(f"model file for {row.name} is missing — e to pick another, h to download")
+        elif not self.has_bin:
+            self.say("llama-server not found — + Setup & models walks you through setting it up")
+        else:
+            p = self.p
+            lines = [Text.assemble(("Auto-tune ", p.text), (row.name, f"bold {p.accent}")),
+                     Text("Starts llama-server several times with candidate GPU-layer / MoE / batch / thread "
+                          "settings and keeps the fastest. Asks before saving.", style=p.dim)]
+            self.tune_chooser.open("Tune", lines, TUNE_OPTIONS)
 
     def ask_delete(self, row: Row) -> None:
         if row.running:
@@ -212,6 +319,9 @@ class Menu:
 
     def enter(self) -> tuple[str, str] | None:
         row = self.rows[self.sel]
+        if row.kind == "settings":
+            self.open_settings()
+            return None
         if row.kind != "profile":
             return (row.kind, "")
         if row.error:
@@ -251,6 +361,8 @@ class Menu:
             Layout(self.header(), size=4),
             Layout(Text("─" * w, style=p.dim), size=1),
             Layout(self.picker.render(p) if self.picker.active else
+                   self.settings.render(p, self.cfg) if self.settings.active else
+                   self.tune_chooser.render(p) if self.tune_chooser.active else
                    self.modal.render(p) if self.modal.active else
                    self.chooser.render(p) if self.chooser.active else self.body(body_h), size=body_h),
             Layout(self.status(), size=1),
@@ -327,12 +439,12 @@ class Menu:
         items = [("↑↓", "choose"), ("Enter", "serve / chat" if row.kind == "profile" and not row.running
                                      else ("monitor / chat" if row.kind == "profile" else "open"))]
         if row.kind == "profile":
-            items += [("c", "chat"), ("e", "edit (setup)")]
+            items += [("c", "chat"), ("t", "tune"), ("e", "edit (setup)")]
             if row.running:
                 items.append(("x", "stop"))
             else:
                 items.append(("d", "delete"))
-        items += [("r", "router"), ("n", "setup & models"), ("i", "import"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
+        items += [("r", "router"), ("n", "setup & models"), ("i", "import"), ("h", "hub"), ("o", "settings"), ("q", "quit")]
         t = Text()
         for key, label in items:
             t.append(key, style=f"bold {p.accent}")
