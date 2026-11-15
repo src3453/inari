@@ -686,7 +686,8 @@ def cmd_cli(a: argparse.Namespace) -> None:
         label = p.name
     c = chat.Chat(console, url, model=model, label=label, system=system, params=params,
                   # piped one-shot output (`inari cli x -p … > out.txt`) gets the answer only
-                  show_reasoning=not getattr(a, "no_think", False) and (prompt is None or sys.stdout.isatty()))
+                  show_reasoning=not getattr(a, "no_think", False) and (prompt is None or sys.stdout.isatty()),
+                  markdown=not getattr(a, "plain", False))
     ok = True
     try:
         chat.wait_ready(console, url, alive=alive, log=log, label=label)
@@ -859,6 +860,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--temp", type=float, help="temperature for this chat (default: the profile's)")
     s.add_argument("-n", "--n-predict", type=int, metavar="N", help="max tokens per reply")
     s.add_argument("--no-think", action="store_true", help="hide the model's reasoning (/think toggles it)")
+    s.add_argument("--plain", action="store_true",
+                   help="show replies as plain text instead of rendered Markdown (/md toggles it)")
     s.add_argument("--keep", action="store_true",
                    help="keep the llama-server started for the chat running afterwards")
     s.add_argument("--port", type=int, help="listen port when a server is started for the chat")

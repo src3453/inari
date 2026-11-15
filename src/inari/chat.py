@@ -16,7 +16,12 @@ from pathlib import Path
 
 import httpx
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.markup import escape
+from rich.console import Group
+from rich.segment import Segment
+from rich.text import Text
 
 HELP = [("/help", "this list"),
         ("/clear", "start a new conversation (keeps the system prompt)"),
@@ -24,6 +29,7 @@ HELP = [("/help", "this list"),
         ("/undo", "drop the last exchange"),
         ("/system [TEXT]", "show or set the system prompt (starts a new conversation)"),
         ("/think", "show / hide the model's reasoning"),
+        ("/md", "Markdown rendering on / off (plain text)"),
         ("/info", "model, server and conversation size"),
         ("/exit", "leave (also /quit, /bye, Ctrl+D, Ctrl+C at an empty prompt)"),
         ('"""', "start / end a multi-line message (or end a line with \\ to continue it)")]
@@ -66,6 +72,96 @@ def wait_ready(console: Console, url: str, *, alive=None, log: str | None = None
             time.sleep(0.4)
 
 
+def split_stable(text: str) -> tuple[str, str]:
+    """Split streamed Markdown into (finished blocks, block still being written).
+
+    The cut goes after the last blank line that is not inside a ``` / ~~~ code fence, so a finished part
+    never changes when more text arrives and can be printed for good."""
+    cut = offset = 0
+    fence = ""
+    for line in text.split("\n")[:-1]:  # the last piece is an unfinished line
+        s = line.strip()
+        if fence:
+            if s.startswith(fence) and set(s) == {fence[0]}:
+                fence = ""
+        elif s.startswith(("```", "~~~")):
+            fence = s[:3]
+        offset += len(line) + 1
+        if not fence and not s:
+            cut = offset
+    return text[:cut], text[cut:]
+
+
+class MarkdownStream:
+    """Renders a streamed reply as Markdown: finished blocks are printed once, the block being written is
+    redrawn in a transient Live area underneath (only its last screenful, so tall code blocks keep up)."""
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.buf = ""
+        self.printed = False
+        self.live = Live(console=console, transient=True, auto_refresh=False, vertical_overflow="crop")
+        self.live.start()
+        self.last = 0.0
+
+    def _md(self, text: str) -> Markdown:
+        return Markdown(text, code_theme="monokai", hyperlinks=True)
+
+    def _emit(self, text: str) -> None:
+        if not text.strip():
+            return
+        # Rich pads some blocks (lists, code, tables) with blank lines; trim them so every chunk is
+        # separated by exactly one blank line, whatever it starts or ends with
+        lines = self.console.render_lines(self._md(text), self.console.options, pad=False)
+
+        def blank(line: list[Segment]) -> bool:
+            return not "".join(s.text for s in line).strip()
+
+        while lines and blank(lines[0]):
+            lines.pop(0)
+        while lines and blank(lines[-1]):
+            lines.pop()
+        if not lines:
+            return
+        out = [Text.assemble(*[(s.text, s.style) for s in line if not s.control]) for line in lines]
+        if self.printed:
+            out.insert(0, Text(""))
+        self.console.print(Group(*out), crop=False, overflow="ignore", no_wrap=True)
+        self.printed = True
+
+    def _tail(self) -> str:
+        lines = self.buf.split("\n")
+        room = max(self.console.size.height - 3, 4)
+        if len(lines) <= room:
+            return self.buf
+        opener = ""
+        for ln in lines:  # keep the open fence so the visible tail still renders as code
+            s = ln.strip()
+            if opener and s.startswith(opener[:3]) and set(s) == {opener[0]}:
+                opener = ""
+            elif not opener and s.startswith(("```", "~~~")):
+                opener = s
+        tail = lines[-(room - 1):]
+        return "\n".join(([opener] if opener else []) + tail)
+
+    def feed(self, piece: str) -> None:
+        self.buf += piece
+        done, self.buf = split_stable(self.buf)
+        if done:
+            self.live.update(Text(""), refresh=True)
+            self._emit(done)
+        now = time.monotonic()
+        if done or now - self.last >= 0.08:
+            self.live.update(self._md(self._tail()), refresh=True)
+            self.last = now
+
+    def close(self) -> None:
+        self.live.update(Text(""), refresh=True)
+        self.live.stop()
+        self._emit(self.buf)
+        self.buf = ""
+
+
 @dataclass
 class Reply:
     content: str = ""
@@ -79,8 +175,9 @@ class Reply:
 
 class Chat:
     def __init__(self, console: Console, url: str, *, model: str = "", label: str = "", system: str = "",
-                 params: dict | None = None, show_reasoning: bool = True) -> None:
+                 params: dict | None = None, show_reasoning: bool = True, markdown: bool = True) -> None:
         self.console = console
+        self.markdown = markdown  # render replies with Rich Markdown (terminal only; piped output stays raw)
         self.url = url.rstrip("/")
         self.model = model
         self.label = label or model or url
@@ -136,6 +233,7 @@ class Chat:
         cancel = threading.Event()
         worker = threading.Thread(target=self._stream, args=(body, out, holder, cancel), daemon=True)
         rep, mode, t0 = Reply(), "", time.monotonic()
+        md: MarkdownStream | None = None
         status = self.console.status("[dim]thinking…  Ctrl+C stops[/]")
         status.start()
         waiting = True
@@ -182,8 +280,13 @@ class Chat:
                                 self.console.print("\n[dim]┄┄┄┄┄┄┄┄┄┄┄┄[/]")
                             mode = "say"
                             rep.content += piece
-                            self.console.print(piece, end="", style="text", markup=False, highlight=False,
-                                               soft_wrap=True)
+                            if md is None and self.markdown and self.console.is_terminal:
+                                md = MarkdownStream(self.console)
+                            if md is not None:
+                                md.feed(piece)
+                            else:
+                                self.console.print(piece, end="", style="text", markup=False, highlight=False,
+                                                   soft_wrap=True)
         except KeyboardInterrupt:
             rep.stopped = True
             cancel.set()
@@ -196,8 +299,10 @@ class Chat:
         finally:
             if waiting:
                 status.stop()
+            if md is not None:
+                md.close()
         rep.seconds = time.monotonic() - t0
-        if mode:
+        if mode and md is None:
             self.console.print()
         return rep
 
@@ -306,6 +411,9 @@ class Chat:
         elif cmd == "/think":
             self.show_reasoning = not self.show_reasoning
             self.console.print(f"[dim]  reasoning {'shown' if self.show_reasoning else 'hidden'}[/]")
+        elif cmd in ("/md", "/markdown", "/plain"):
+            self.markdown = cmd != "/plain" and not self.markdown
+            self.console.print(f"[dim]  replies {'rendered as Markdown' if self.markdown else 'shown as plain text'}[/]")
         elif cmd == "/info":
             turns = sum(1 for m in self.history if m["role"] == "user")
             chars = sum(len(m["content"]) for m in self.messages())
