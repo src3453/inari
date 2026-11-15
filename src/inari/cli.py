@@ -11,6 +11,7 @@ from pathlib import Path
 
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -624,6 +625,92 @@ def cmd_monitor(a: argparse.Namespace) -> None:
     attach(runs[int(idx) - 1])
 
 
+# ───────────────────────── cli (chat in the terminal) ─────────────────────────
+def pick_profile_interactive(prompt: str = "Chat with #") -> str:
+    names = list_profiles()
+    if not names:
+        die("no profiles yet — make one with: inari setup")
+    if len(names) == 1:
+        return names[0]
+    runs = {r.name for r in server.active_runs()}
+    for i, n in enumerate(names, 1):
+        console.print(f"  [accent2]{i:>2}[/] {n}" + ("  [good]● serving[/]" if n in runs else ""))
+    idx = Prompt.ask(f"[accent]{prompt}[/]", choices=[str(i) for i in range(1, len(names) + 1)],
+                     show_choices=False, console=console)
+    return names[int(idx) - 1]
+
+
+def cmd_cli(a: argparse.Namespace) -> None:
+    """Chat in the terminal like llama-cli. Uses a server that already serves the profile (on its own or via
+    the router); otherwise starts llama-server for the chat and stops it again when you leave."""
+    from inari import chat, router
+
+    params: dict = {}
+    if getattr(a, "temp", None) is not None:
+        params["temperature"] = a.temp
+    if getattr(a, "n_predict", None):
+        params["max_tokens"] = a.n_predict
+    prompt = getattr(a, "prompt", None)
+    if prompt is None and not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    system = getattr(a, "system", None) or ""
+
+    started: server.RunInfo | None = None
+    if getattr(a, "url", None):
+        url, model, label, alive, log = a.url, getattr(a, "model", None) or "", a.url, None, None
+    else:
+        name = getattr(a, "profile", None)
+        if not name:
+            runs = [r for r in server.active_runs() if r.name != router.NAME]
+            name = runs[0].name if len(runs) == 1 and not server.find_run(router.NAME) else pick_profile_interactive()
+        p = load_profile(name)
+        own, rt = server.find_run(p.name), server.find_run(router.NAME)
+        if own:
+            url, model, alive, log = own.url, "", own.alive, own.log
+            console.print(f"[accent]●[/] {p.name} is already serving at [accent2]{own.url}[/] — using it")
+        elif rt and not getattr(a, "no_router", False):
+            url, model, alive, log = rt.url, p.name, rt.alive, rt.log
+            console.print(f"[accent]●[/] using the running router at [accent2]{rt.url}[/] "
+                          f"[dim](model {p.name} loads on the first message)[/]")
+        else:
+            if getattr(a, "port", None):
+                p.port = a.port
+            try:
+                started, _ = server.launch(p, cfg)
+            except (FileNotFoundError, RuntimeError) as e:
+                die(str(e))
+                return
+            url, model, alive, log = started.url, "", started.alive, started.log
+            console.print(f"[accent]▶[/] started [accent]{p.name}[/] pid {started.pid} → [accent2]{started.url}[/]  "
+                          f"[dim]log: {started.log}[/]", soft_wrap=True)
+        label = p.name
+    c = chat.Chat(console, url, model=model, label=label, system=system, params=params,
+                  # piped one-shot output (`inari cli x -p … > out.txt`) gets the answer only
+                  show_reasoning=not getattr(a, "no_think", False) and (prompt is None or sys.stdout.isatty()))
+    ok = True
+    try:
+        chat.wait_ready(console, url, alive=alive, log=log, label=label)
+        if prompt is not None:
+            ok = c.once(prompt)
+        else:
+            c.loop()
+    except chat.ChatError as e:
+        console.print(f"[bad]✖[/] {escape(str(e))}")
+        ok = False
+    except KeyboardInterrupt:
+        console.print("[dim]cancelled[/]")
+    finally:
+        if started is not None:
+            if getattr(a, "keep", False) and started.alive():
+                console.print(f"[accent]●[/] [text]{started.name}[/] keeps serving at [accent2]{started.url}[/]  "
+                              f"[dim](inari monitor {started.name} · inari stop {started.name})[/]")
+            else:
+                with console.status("[accent]Stopping llama-server…[/]"):
+                    server.stop(started)
+    if not ok and prompt is not None:
+        sys.exit(1)
+
+
 def cmd_ps(a: argparse.Namespace) -> None:
     import time
 
@@ -764,6 +851,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-tui", action="store_true", help="start in background and return")
     s.set_defaults(fn=cmd_serve)
 
+    s = sub.add_parser("cli", aliases=["chat"],
+                       help="chat with a profile's model in the terminal, like llama-cli")
+    s.add_argument("profile", nargs="?", help="profile to chat with (omit to pick one)")
+    s.add_argument("-p", "--prompt", help="answer this one prompt and exit (stdin works too)")
+    s.add_argument("-s", "--system", help="system prompt")
+    s.add_argument("--temp", type=float, help="temperature for this chat (default: the profile's)")
+    s.add_argument("-n", "--n-predict", type=int, metavar="N", help="max tokens per reply")
+    s.add_argument("--no-think", action="store_true", help="hide the model's reasoning (/think toggles it)")
+    s.add_argument("--keep", action="store_true",
+                   help="keep the llama-server started for the chat running afterwards")
+    s.add_argument("--port", type=int, help="listen port when a server is started for the chat")
+    s.add_argument("--no-router", action="store_true",
+                   help="start the profile on its own even if the router is running")
+    s.add_argument("--url", help="chat with any running llama-server, e.g. http://127.0.0.1:8080")
+    s.add_argument("-m", "--model", help="with --url: the model name to request (router)")
+    s.set_defaults(fn=cmd_cli)
+
     s = sub.add_parser("monitor", aliases=["mon", "top"], help="open the monitor for a running server")
     s.add_argument("profile", nargs="?")
     s.add_argument("--url", help="monitor any llama-server read-only, e.g. http://127.0.0.1:8080")
@@ -835,6 +939,9 @@ def main_menu() -> None:
         try:
             if action == "serve":
                 cmd_serve(argparse.Namespace(profile=name, port=None, no_tui=False))
+            elif action == "chat":
+                console.clear()
+                cmd_cli(argparse.Namespace(profile=name))
             elif action == "router":
                 cmd_serve(argparse.Namespace(profile=None, port=None, no_tui=False))
             elif action in ("new", "edit"):
@@ -886,12 +993,13 @@ def print_help() -> None:
 
     console.print(banner(th.get(cfg.theme), console))
     console.print()
-    for c, d in (("", "main menu: pick a profile to serve, or set one up"),
+    for c, d in (("", "main menu: pick a profile to serve or chat with, or set one up"),
                  ("setup [PROFILE]", "setup & models wizard: new profile, manage local models (start here)"),
                  ("import [COMMAND]", "llama-server command → profile (+ model download)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
                  ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
                  ("profile new|set|show|ls", "save llama-server arguments"),
                  ("tune PROFILE", "benchmark & pick the fastest GPU/batch/thread settings"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
+                 ("cli [PROFILE]", "chat with a model in the terminal, like llama-cli"),
                  ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),
                  ("demo", "try the monitor with a simulated server"), ("config", "settings")):
         console.print(f"  [accent]inari {c:<26}[/][dim]{d}[/]")

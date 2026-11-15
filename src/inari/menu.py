@@ -17,7 +17,7 @@ from inari.config import Config
 from inari.hubtui import window
 from inari.inari_logo import banner
 from inari.keys import KeyReader
-from inari.modal import ConfirmModal
+from inari.modal import ChoiceModal, ConfirmModal
 from inari.profiles import Profile, list_profiles
 from inari.themepick import ThemePicker
 
@@ -43,7 +43,9 @@ ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded o
 
 class Menu:
     """``run()`` returns ``(action, profile_name)``:
-    serve · edit · stop · new · hub · demo · quit. Deleting a profile happens in place."""
+    serve · chat · edit · stop · new · hub · demo · quit. Deleting a profile happens in place."""
+
+    last_launch = "serve"  # what Enter on a profile chose last time — focused first in the chooser
 
     def __init__(self, cfg: Config, console: Console, *, select: str = "", flash: str = "") -> None:
         self.cfg = cfg
@@ -51,6 +53,7 @@ class Menu:
         self.p = th.get(cfg.theme)
         self.picker = ThemePicker()
         self.modal = ConfirmModal()
+        self.chooser = ChoiceModal()
         self.rows: list[Row] = []
         self.sel = 0
         self.confirm: tuple[str, str, str] | None = None  # (question, action, name)
@@ -122,6 +125,12 @@ class Menu:
         if self.modal.active:
             self.modal.handle(key)
             return None
+        if self.chooser.active:
+            got = self.chooser.handle(key)
+            if got in ("serve", "chat"):
+                Menu.last_launch = got
+                return (got, self.rows[self.sel].name)
+            return None
         if key in ("ctrl+c", "q", "Q"):
             return ("quit", "")
         if self.confirm:
@@ -163,6 +172,8 @@ class Menu:
             return None
         if key == "e":
             return ("edit", row.name)
+        if key == "c":
+            return self.launch("chat")
         if key in ("d", "delete"):
             self.ask_delete(row)
             return None
@@ -209,7 +220,26 @@ class Menu:
         if row.missing and not row.running:
             self.say(f"model file for {row.name} is missing — e to pick another, h to download")
             return None
-        return ("serve", row.name)
+        p = self.p
+        lines = [Text.assemble(("Start ", p.text), (row.name, f"bold {p.accent}"),
+                               ("  ● serving" if row.running else "", p.good)),
+                 Text.assemble(("model  ", p.dim), (row.model or "—", p.text))]
+        self.chooser.open("Start", lines, [
+            ("serve", "s", "Monitor" if row.running else "Serve", "re-attach the monitor" if row.running
+             else "start llama-server + monitor (keeps serving)"),
+            ("chat", "c", "Chat (cli)", "chat in the terminal, like llama-cli"
+             + ("" if row.running else " — stops it when you leave"))], default=Menu.last_launch)
+        return None
+
+    def launch(self, what: str) -> tuple[str, str] | None:
+        row = self.rows[self.sel]
+        if row.error:
+            self.say(f"can't read {row.name}: {row.error}")
+            return None
+        if row.missing and not row.running:
+            self.say(f"model file for {row.name} is missing — e to pick another, h to download")
+            return None
+        return (what, row.name)
 
     # ───────── render ─────────
     def render(self) -> RenderableType:
@@ -221,7 +251,8 @@ class Menu:
             Layout(self.header(), size=4),
             Layout(Text("─" * w, style=p.dim), size=1),
             Layout(self.picker.render(p) if self.picker.active else
-                   self.modal.render(p) if self.modal.active else self.body(body_h), size=body_h),
+                   self.modal.render(p) if self.modal.active else
+                   self.chooser.render(p) if self.chooser.active else self.body(body_h), size=body_h),
             Layout(self.status(), size=1),
             Layout(self.hints(), size=2),
         )
@@ -293,10 +324,10 @@ class Menu:
     def hints(self) -> RenderableType:
         p = self.p
         row = self.rows[self.sel]
-        items = [("↑↓", "choose"), ("Enter", "serve" if row.kind == "profile" and not row.running
-                                     else ("monitor" if row.kind == "profile" else "open"))]
+        items = [("↑↓", "choose"), ("Enter", "serve / chat" if row.kind == "profile" and not row.running
+                                     else ("monitor / chat" if row.kind == "profile" else "open"))]
         if row.kind == "profile":
-            items.append(("e", "edit (setup)"))
+            items += [("c", "chat"), ("e", "edit (setup)")]
             if row.running:
                 items.append(("x", "stop"))
             else:
