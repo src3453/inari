@@ -24,7 +24,7 @@ from inari.themepick import ThemePicker
 
 @dataclass
 class Row:
-    kind: str  # "profile" | "router" | "new" | "hub" | "demo" | "quit"
+    kind: str  # "profile" | "router" | "new" | "import" | "hub" | "demo" | "quit"
     name: str = ""
     model: str = ""
     listen: str = ""
@@ -35,6 +35,7 @@ class Row:
 
 ACTIONS = [("router", "⇄ Router", "serve every profile from one port, loaded on demand"),
            ("new", "+ New profile", "guided setup wizard"),
+           ("import", "⇲ Import command", "paste a llama-server command line → profile"),
            ("hub", "↓ Hub", "search Hugging Face and download GGUFs"),
            ("demo", "▷ Demo", "try the monitor with a simulated server"),
            ("quit", "× Quit", "")]
@@ -142,6 +143,8 @@ class Menu:
             return ("new", "")
         if key == "h":
             return ("hub", "")
+        if key == "i":
+            return ("import", "")
         if key == "r":
             return ("router", "")
         if key == "t":
@@ -298,7 +301,7 @@ class Menu:
                 items.append(("x", "stop"))
             else:
                 items.append(("d", "delete"))
-        items += [("r", "router"), ("n", "new profile"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
+        items += [("r", "router"), ("n", "new profile"), ("i", "import"), ("h", "hub"), ("t", "theme"), ("q", "quit")]
         t = Text()
         for key, label in items:
             t.append(key, style=f"bold {p.accent}")

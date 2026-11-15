@@ -115,7 +115,7 @@ def free_port(skip: str = "") -> int:
 
 class Wizard:
     def __init__(self, cfg: Config, console: Console, *, name: str = "", theme_name: str = "kitsune",
-                 start: str = "") -> None:
+                 start: str = "", seed: Profile | None = None, origin: str = "") -> None:
         self.cfg = cfg
         self.console = console
         self.theme_name = theme_name
@@ -139,7 +139,13 @@ class Wizard:
         self.why: dict[str, str] = {}
         self.apply_tuned = True
 
-        if name and Profile.path_for(name).exists():
+        self.origin = origin  # e.g. "imported from a command" — shown in the header
+
+        if seed is not None:  # a profile built elsewhere (inari import), not saved yet
+            self._apply(seed)
+            self.editing = ""
+            self.dirty = True
+        elif name and Profile.path_for(name).exists():
             self._load(name)
         elif name:
             self.name, self.name_touched = name, True
@@ -159,15 +165,18 @@ class Wizard:
         self.flash: tuple[str, float] | None = None
         self.result: Result | None = None
         self.exit_reason = ""
-        self.dirty = False
+        self.dirty = seed is not None
 
     # ───────── model / profile state ─────────
     def _scan_models(self) -> list[hub.LocalModel]:
         return [m for m in hub.local_models(self.cfg) if "mmproj" not in m.path.name.lower()]
 
     def _load(self, name: str) -> None:
-        p = Profile.load(name)
-        self.editing = self.name = name
+        self._apply(Profile.load(name))
+        self.editing = name
+
+    def _apply(self, p: Profile) -> None:
+        self.name = p.name
         self.name_touched = True
         self.description = p.description
         self.host, self.port = p.host, p.port
@@ -796,6 +805,8 @@ class Wizard:
         t.append(f"    Step {self.step + 1} of {len(STEPS)}: {STEPS[self.step][1]}", style=f"bold {p.text}")
         if self.editing:
             t.append(f"    editing {self.editing}", style=p.dim)
+        elif self.origin:
+            t.append(f"    {self.origin}", style=p.dim)
         dots = Text()
         for i, (_, label) in enumerate(STEPS):
             on = i == self.step
@@ -1119,9 +1130,10 @@ class Wizard:
         return t
 
 
-def run_wizard(cfg: Config, console: Console, *, name: str = "", start: str = "") -> Result | None:
+def run_wizard(cfg: Config, console: Console, *, name: str = "", start: str = "", seed: Profile | None = None,
+               origin: str = "") -> Result | None:
     with console.status("[accent]Reading llama-server settings and devices…[/]"):
-        wiz = Wizard(cfg, console, name=name, theme_name=cfg.theme, start=start)
+        wiz = Wizard(cfg, console, name=name, theme_name=cfg.theme, start=start, seed=seed, origin=origin)
     while True:
         try:
             reason = wiz.run()

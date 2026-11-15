@@ -26,7 +26,7 @@ NVIDIA GPU で負荷・温度・電力も見たいときは: `uv sync --extra nv
 uv run inari                    # 引数なしで起動するとメインメニュー
 ```
 
-保存済みプロファイルの一覧（モデル・ポート・起動状態）から選んで `Enter` で起動＆モニタ表示（起動中ならモニタに再接続）。`1`〜`9` で直接起動、`e` で選択中のプロファイルをセットアップウィザードで編集、`n` で新規セットアップ、`h` で Hub、`x` で起動中のサーバーを停止、`d` / `Del` で選択中のプロファイルを削除（確認モーダルあり。モデルファイルは残ります）、`q` で終了。モニタやウィザードを閉じるとメニューに戻ります。全コマンドの一覧は `inari --help`（パイプ等で TTY でないときは従来どおりコマンド一覧を表示）。
+保存済みプロファイルの一覧（モデル・ポート・起動状態）から選んで `Enter` で起動＆モニタ表示（起動中ならモニタに再接続）。`1`〜`9` で直接起動、`e` で選択中のプロファイルをセットアップウィザードで編集、`n` で新規セットアップ、`i` で既存の llama-server コマンドを取り込み、`h` で Hub、`x` で起動中のサーバーを停止、`d` / `Del` で選択中のプロファイルを削除（確認モーダルあり。モデルファイルは残ります）、`q` で終了。モニタやウィザードを閉じるとメニューに戻ります。全コマンドの一覧は `inari --help`（パイプ等で TTY でないときは従来どおりコマンド一覧を表示）。
 
 ### セットアップウィザード（はじめての方はここから）
 
@@ -41,6 +41,23 @@ llama-server → モデル（`h` で Hub からダウンロード、`d` / `Del` 
 - **Advanced** は、設定済み llama-server の `--help` から読み取った全フラグを `Default`（llama.cpp 既定）/ `Tuned`（inari の推奨）/ `Yours`（あなたの値）で一覧表示。`/` 絞り込み、`x` experimental のみ、`Enter` 編集、`←→` 選択肢切替、`Del` リセット、`a` 名前で追加、`c` コマンドをコピー、`u` Tuned 値の適用 on/off
 - **Tuned** は `llama-server --list-devices` の VRAM と GGUF メタデータ（学習時コンテキスト長、層数、MoE など）から計算
 - `--help` の解析結果はビルドごとに `~/.inari/cache/` にキャッシュ
+
+### 既存の llama-server コマンドから取り込む
+
+```bash
+uv run inari import             # コマンドを貼り付け（空行で確定）。メインメニューでは i
+uv run inari import llama-server -hf unsloth/Qwen3-8B-GGUF:Q4_K_M -c 32768 -ngl 99 -fa on --jinja
+uv run inari import -f run.sh   # スクリプト（.sh / .bat / .ps1）から読む
+uv run inari import -y -p qwen3-8b "..."   # 確認なしでダウンロードし、ウィザードを開かずに保存
+```
+
+設定済み llama-server の `--help` を使って引数を読み取るので、`-c` / `--ctx-size` / `--ctx-size=…` のどの書き方でも同じキーになります。読み取った内容を表示したあと、セットアップウィザードの Review ステップで開くので、確認・調整してから保存できます。
+
+- `-m PATH` → そのファイル（HF キャッシュ内なら `hf://` 参照に変換）。見つからなければローカルのモデルからファイル名で探す
+- `-hf owner/repo[:QUANT]`（`-hff` も可）/ `-mu https://huggingface.co/…/resolve/…` → llama.cpp と同じ規則でファイルを選び（QUANT 省略時は Q4_K_M）、HF キャッシュにあればそれを使い、無ければサイズを確認してダウンロード。`-hf` と同様に mmproj も取得（`--no-mmproj` なら取得しない）
+- `--host` / `--port` はプロファイルの listen に、`FOO=1 llama-server …`・`$env:FOO="1"; …`・`set FOO=1 && …` は `[env]` に入る
+- その llama-server のビルドが知らないフラグは `extra` にそのまま残し、`--hf-token` は保存しない（`inari config set hf_token` を使う）。`--metrics` は inari が自動で付けるので省く
+- コマンドの llama-server が設定と違うビルドなら、プロファイルの `server_bin` に記録（未設定なら `llama_server` として登録）
 
 ```bash
 # Hugging Face を TUI で検索してダウンロード（→ 完了後 p でプロファイル作成）
@@ -137,6 +154,18 @@ GGML_VK_VISIBLE_DEVICES = "0"
 | `Tab` | ダウンロード一覧へ移動 → `p` でプロファイル作成、`x` でキャンセル |
 | `Esc` | 戻る |
 | `b` | Hugging Face のページをブラウザで開く |
+
+ファイル一覧の **FIT** 列は、この PC の RAM + VRAM の総量から見た動作の目安です（重み + 控えめなコンテキスト分の余裕で概算。mmproj を付けるとその分も加算）。
+
+| 表示 | 意味 |
+|---|---|
+| `◆ GPU` | VRAM に全部載る。最速 |
+| `◐ GPU+RAM` | 一部を RAM にオフロード。動くが遅くなる |
+| `○ CPU` | GPU なし。RAM から CPU で動かす |
+| `△ tight` | ギリギリ。他のアプリを閉じ、コンテキストを小さめに |
+| `✖ too big` | 足りない |
+
+`★` はスペックからのおすすめで、ファイル一覧を開いたときのカーソル位置にもなります。VRAM に全部載る中で一番大きい量子化（ただし約 3.4 bit/weight 以上）を優先し、載らない場合は Q4_K_M 前後を RAM オフロード前提で選びます。F16 / BF16 は他に候補がないときだけ。GPU は `llama-server --list-devices` で検出するので CUDA / ROCm / Vulkan / Metal いずれでも VRAM が反映されます（検出完了まで数秒は RAM のみで判定）。
 
 ### モニタのキー
 

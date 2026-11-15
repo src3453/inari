@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -278,6 +279,153 @@ def cmd_setup(a: argparse.Namespace) -> None:
         console.print(f"  run it: [accent]inari serve {res.name}[/]   ·   change it: [accent]inari setup {res.name}[/]")
 
 
+# ───────────────────────── import a llama-server command ─────────────────────────
+def read_command_interactive() -> str:
+    console.print("[accent]Paste your llama-server command[/] [dim](line continuations \\ ^ ` are fine; "
+                  "empty line to finish)[/]")
+    lines: list[str] = []
+    while True:
+        try:
+            line = console.input("[accent2]› [/]" if not lines else "[dim]… [/]")
+        except EOFError:
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def import_command(text: str, *, name: str = "", yes: bool = False, via: str = "", wizard: bool = True):
+    """Parse ``text``, download the model if needed, then open the setup wizard on Review (or save directly).
+    Returns the wizard Result, the saved Profile (``wizard=False``) or None."""
+    from inari import argspec, importer
+    from inari.wizard import free_port, run_wizard
+
+    if not text.strip():
+        console.print("[dim]nothing pasted — nothing imported[/]")
+        return None
+    tokens, _ = importer.split_statements(text)
+    binary = ""
+    if tokens and not tokens[0].startswith("-"):
+        cand = Path(tokens[0]).expanduser()
+        binary = str(cand) if cand.is_file() else (shutil.which(tokens[0]) or "")
+    with console.status("[accent]Reading llama-server settings…[/]"):
+        cat = argspec.load(cfg, binary or None)
+    imp = importer.parse(text, cat, cfg)
+
+    # ── what we understood ──
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", no_wrap=True)
+    t.add_column(style="text", overflow="fold")
+    t.add_row("binary", imp.binary or "—")
+    if imp.hf:
+        target = imp.hf.repo + (f":{imp.hf.quant}" if imp.hf.quant else "") + (f"  {imp.hf.file}" if imp.hf.file else "")
+        t.add_row("model", f"{imp.model or target}" + ("" if imp.model else "  [warn](not downloaded yet)[/]"))
+    else:
+        t.add_row("model", (imp.model or "[bad]none[/]") +
+                  ("" if not imp.model or imp.model_path else "  [bad](missing)[/]"))
+    if imp.host or imp.port:
+        t.add_row("listen", f"{imp.host or '127.0.0.1'}:{imp.port or '(free port)'}")
+    for k_, v in imp.args.items():
+        t.add_row(f"[accent2]{k_}[/]", str(v))
+    if imp.extra:
+        t.add_row("extra", " ".join(imp.extra))
+    for k_, v in imp.env.items():
+        t.add_row(f"env.{k_}", v)
+    console.print(Panel(t, title="[accent] imported [/]", title_align="left", border_style="dim", box=box.ROUNDED))
+    for n in imp.notes:
+        console.print(f"  [warn]·[/] [dim]{n}[/]", soft_wrap=True)
+
+    # ── fetch the model when the command used -hf / a Hugging Face URL ──
+    if imp.needs_fetch:
+        try:
+            with console.status(f"[accent]Looking up[/] [text]{imp.hf.repo}[/] …"):
+                pl = importer.plan(cfg, imp)
+        except Exception as e:  # network / auth / 404 / no match
+            console.print(f"[bad]✖[/] could not look up the model: {e}")
+            pl = None
+        if pl and len(pl.choices) > 1 and not yes:
+            for i, g in enumerate(pl.choices, 1):
+                console.print(f"  [accent2]{i:>2}[/] {g.name}  [dim]{g.quant} · {hub.human(g.size)}[/]")
+            idx = Prompt.ask("[accent]Several files match — which #[/]",
+                             choices=[str(i) for i in range(1, len(pl.choices) + 1)], default="1",
+                             show_choices=False, console=console)
+            pl.model = pl.choices[int(idx) - 1]
+        if pl and importer.link_existing(cfg, imp, pl):
+            console.print(f"[good]✔[/] already in the HF cache: [text]{imp.model}[/]")
+        elif pl:
+            what = pl.model.name + (f" + {pl.mmproj.name}" if pl.mmproj else "")
+            console.print(f"  [dim]→ {hfcache.repo_dir(cfg, pl.repo)}[/]", soft_wrap=True)
+            if yes or Confirm.ask(f"[accent]Download[/] [text]{what}[/] ([accent2]{hub.human(pl.size)}[/])?",
+                                  default=True, console=console):
+                try:
+                    importer.fetch(cfg, imp, pl, console, backend=via)
+                    console.print(f"[good]✔ Downloaded[/] [text]{imp.model}[/]")
+                except Exception as e:
+                    console.print(f"[bad]✖[/] download failed: {e}")
+        if not imp.model:
+            console.print("[warn]·[/] [dim]no model yet — pick or download one in the wizard[/]")
+
+    # ── the profile ──
+    prof = new_profile(name or imp.suggested_name(), model=imp.model, description="imported from a command")
+    prof.args = dict(imp.args)
+    prof.extra, prof.env = list(imp.extra), dict(imp.env)
+    prof.host = imp.host or prof.host
+    prof.port = imp.port or free_port()
+    if binary and not (cfg.server_binary() and importer.same_binary(binary, cfg.server_binary())):
+        if cfg.server_binary():
+            prof.server_bin = binary  # this command used another build: keep using it for this profile
+        else:
+            cfg.llama_server = binary
+            cfg.save()
+            console.print(f"[good]✔[/] llama_server set to [text]{binary}[/]")
+
+    if not wizard:
+        if not prof.model:
+            die("no model — run again without -y to pick one in the wizard")
+        base, n = prof.name, 2
+        while Profile.path_for(prof.name).exists() and not name:
+            prof.name, n = f"{base}-{n}", n + 1
+        prof.save()
+        console.print(f"[good]✔ Profile[/] [accent]{prof.name}[/] saved → [dim]{Profile.path_for(prof.name)}[/]")
+        show_profile(prof)
+        return prof
+    if not yes:
+        console.input("[dim]Enter to review it in the setup wizard[/] ")
+    return run_wizard(cfg, console, seed=prof, start="review" if prof.model else "model",
+                      origin="imported from a llama-server command")
+
+
+def cmd_import(a: argparse.Namespace) -> None:
+    if a.file:
+        try:
+            text = Path(a.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            die(f"cannot read {a.file}: {e}")
+            return
+    elif a.command:
+        text = a.command[0] if len(a.command) == 1 else subprocess.list2cmdline(a.command)
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        text = read_command_interactive()
+    res = import_command(text, name=a.profile or "", yes=a.yes, via=a.via or "", wizard=not a.yes)
+    if res is None:
+        console.print("[dim]import cancelled — nothing saved[/]")
+        return
+    if isinstance(res, Profile):
+        console.print(f"  run it: [accent]inari serve {res.name}[/]")
+        return
+    console.print(f"[good]✔ Profile[/] [accent]{res.name}[/] saved → [dim]{res.path}[/]")
+    show_profile(Profile.load(res.name))
+    if res.serve:
+        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+    else:
+        console.print(f"  run it: [accent]inari serve {res.name}[/]   ·   change it: [accent]inari setup {res.name}[/]")
+
+
 # ───────────────────────── serve / monitor ─────────────────────────
 def run_monitor(collector, *, managed: bool, run: server.RunInfo | None = None) -> None:
     from inari.tui import App
@@ -473,6 +621,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-a", "--advanced", action="store_true", help="open the all-settings table directly")
     s.set_defaults(fn=cmd_setup)
 
+    s = sub.add_parser("import", help="turn an existing llama-server command into a profile (downloads -hf models)")
+    s.add_argument("command", nargs=argparse.REMAINDER,
+                   help='the command, quoted or as-is: inari import llama-server -hf unsloth/Qwen3-8B-GGUF -c 32768 '
+                        '(omit to paste it, or pipe it in)')
+    s.add_argument("-f", "--file", help="read the command from a script (.sh / .bat / .ps1)")
+    s.add_argument("-p", "--profile", help="profile name (default: from the model file)")
+    s.add_argument("-y", "--yes", action="store_true", help="download without asking and save without the wizard")
+    s.add_argument("--via", choices=hub.BACKENDS, help="download backend (default: config download_backend)")
+    s.set_defaults(fn=cmd_import)
+
     s = sub.add_parser("pull", help="download a GGUF from Hugging Face (repo or repo:QUANT)")
     s.add_argument("repo", nargs="?", help="e.g. unsloth/Qwen3-8B-GGUF or unsloth/Qwen3-8B-GGUF:Q4_K_M "
                    "(omit to browse in the hub TUI)")
@@ -611,6 +769,15 @@ def main_menu() -> None:
                     select, flash = res.name, f"✔ profile {res.name} saved"
                     if res.serve:
                         cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
+            elif action == "import":
+                text = read_command_interactive()
+                res = import_command(text) if text.strip() else None
+                if res is None:
+                    flash = "import cancelled — nothing saved"
+                else:
+                    select, flash = res.name, f"✔ profile {res.name} imported"
+                    if res.serve:
+                        cmd_serve(argparse.Namespace(profile=res.name, port=None, no_tui=False))
             elif action == "stop":
                 run = server.find_run(name)
                 if run:
@@ -642,7 +809,8 @@ def print_help() -> None:
     console.print(banner(th.get(cfg.theme), console))
     console.print()
     for c, d in (("", "main menu: pick a profile to serve, or set one up"),
-                 ("setup [PROFILE]", "guided setup wizard (start here)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
+                 ("setup [PROFILE]", "guided setup wizard (start here)"),
+                 ("import [COMMAND]", "llama-server command → profile (+ model download)"), ("hub [QUERY]", "search Hugging Face + download (TUI)"),
                  ("pull REPO[:QUANT]", "download a GGUF from Hugging Face"), ("models", "list local models"),
                  ("profile new|set|show|ls", "save llama-server arguments"), ("serve [PROFILE]", "launch + monitor (no profile: router, all models)"),
                  ("monitor [PROFILE]", "re-attach to a running server"), ("ps / stop", "manage servers"),

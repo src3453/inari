@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from inari import hfcache, hub
+from inari import fit, hfcache, hub
 from inari import theme as th
 from inari.config import Config
 from inari.keys import KeyReader
@@ -60,6 +60,7 @@ class HubApp:
         self.p = th.get(theme_name)
         self.picker = ThemePicker()
         self.dl = hub.Downloader(cfg)
+        self.spec = fit.spec(cfg.server_binary())
 
         self.screen = "search"  # search | files
         self.focus = "main"  # main | downloads
@@ -130,7 +131,16 @@ class HubApp:
 
         self._bg(work)
 
+    def recommended(self) -> int | None:
+        if not self.repo:
+            return None
+        proj = self.projector() if self.with_mmproj else None
+        return fit.recommend(self.groups, self.spec, self.repo.params, proj.size if proj else 0)
+
     def _default_pick(self) -> int:
+        rec = self.recommended()
+        if rec is not None:
+            return rec
         for pref in ("Q4_K_M", "Q4_K_XL", "Q4_0", "Q5_K_M"):
             for i, g in enumerate(self.groups):
                 if g.quant.endswith(pref):
@@ -486,8 +496,22 @@ class HubApp:
             mm.append("[x] " if self.with_mmproj else "[ ] ", style=f"bold {p.accent}")
             mm.append(f"{proj.name}  {hub.human(proj.size)}", style=p.text if self.with_mmproj else p.dim)
             mm.append("   m toggle", style=p.dim)
-        top = self.panel(Group(info, mm) if proj else info, hit.id, focused=False, height=4 if proj else 3)
-        top_h = 4 if proj else 3
+        extra = proj.size if proj and self.with_mmproj else 0
+        rec = self.recommended()
+        pc = Text()
+        pc.append("this PC ", style=p.dim)
+        pc.append(self.spec.describe(), style=f"bold {p.text}")
+        if self.groups:
+            sel = self.groups[self.fsel]
+            f = fit.judge(sel.size + extra, self.spec)
+            pc.append("   ")
+            pc.append(f"{sel.quant}: ", style=f"bold {p.accent2}")
+            pc.append(f.note, style=self._fit_style(f.level))
+            if rec is not None and rec != self.fsel:
+                pc.append(f"   ★ {self.groups[rec].quant} recommended", style=p.accent)
+        lines = [info] + ([mm] if proj else []) + [pc]
+        top_h = len(lines) + 2
+        top = self.panel(Group(*lines), hit.id, focused=False, height=top_h)
 
         rows = max(height - top_h - 4, 1)
         if self.error:
@@ -502,6 +526,7 @@ class HubApp:
                       padding=(0, 1), show_edge=False)
             t.add_column("", width=1, no_wrap=True)
             t.add_column("QUANT", no_wrap=True)
+            t.add_column("FIT", no_wrap=True)
             t.add_column("FILE", ratio=3, no_wrap=True, overflow="ellipsis")
             t.add_column("SIZE", justify="right", no_wrap=True)
             t.add_column("", ratio=1, min_width=6, no_wrap=True)
@@ -516,8 +541,11 @@ class HubApp:
                 local = Text("✔ on disk", style=p.good) if state == "done" else \
                     Text("↓ queued", style=p.accent) if queued else \
                     Text("◐ partial", style=p.warn) if state == "partial" else Text("")
-                t.add_row(Text("▸" if on else " ", style=p.accent),
-                          Text(g.quant, style=f"bold {p.accent2}" if on else p.accent2),
+                q = Text(g.quant, style=f"bold {p.accent2}" if on else p.accent2)
+                if i == rec:
+                    q.append(" ★", style=f"bold {p.accent}")
+                f = fit.judge(g.size + extra, self.spec)
+                t.add_row(Text("▸" if on else " ", style=p.accent), q, Text(f.label, style=self._fit_style(f.level)),
                           Text(g.name, style=f"bold {p.text}" if on else p.text),
                           hub.human(g.size), Bar(g.size / biggest, p.accent if on else p.dim, p.track),
                           str(len(g.files)) if len(g.files) > 1 else "", local,
@@ -526,6 +554,10 @@ class HubApp:
         sub = f" {len(self.groups)} files · → {hfcache.repo_dir(self.cfg, hit.id)} "
         files = self.panel(body, "Files", focused=focused, height=height - top_h, subtitle=sub)
         return Group(top, files)
+
+    def _fit_style(self, level: str) -> str:
+        p = self.p
+        return {"gpu": p.good, "split": p.accent2, "cpu": p.warn, "tight": p.warn, "no": p.bad}.get(level, p.dim)
 
     def view_downloads(self, height: int) -> RenderableType:
         p = self.p
