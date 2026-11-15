@@ -481,7 +481,8 @@ class Wizard:
                         if self.handle(key):
                             return self.exit_reason or "done"
                     now = time.monotonic()
-                    if pressed or now - last >= 0.5:
+                    busy = self.tuner is not None and not self.tuner.done
+                    if pressed or now - last >= (0.2 if busy else 0.5):
                         self.poll_install()
                         live.update(self.render(), refresh=True)
                         last = now
